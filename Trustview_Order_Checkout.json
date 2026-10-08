@@ -1,0 +1,778 @@
+{
+    "definition": {
+        "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+        "contentVersion": "1.0.0.0",
+        "triggers": {
+            "When_an_HTTP_request_is_received": {
+                "type": "Request",
+                "kind": "Http",
+                "inputs": {
+                    "method": "POST",
+                    "schema": {
+                        "type": "object",
+                        "required": [
+                            "domains",
+                            "contactEmail",
+                            "deliveryMethod"
+                        ],
+                        "additionalProperties": false,
+                        "properties": {
+                            "domains": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "string",
+                                    "minLength": 1
+                                }
+                            },
+                            "contactEmail": {
+                                "type": "string",
+                                "minLength": 3
+                            },
+                            "keyspec": {
+                                "type": "string",
+                                "enum": [
+                                    "RSA:2048",
+                                    "RSA:4096"
+                                ]
+                            },
+                            "ip_sans": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                }
+                            },
+                            "comment": {
+                                "type": "string"
+                            },
+                            "deliveryMethod": {
+                                "type": "string",
+                                "enum": [
+                                    "email",
+                                    "download"
+                                ]
+                            }
+                        }
+                    }
+                },
+                "runtimeConfiguration": {
+                    "secureData": {
+                        "properties": [
+                            "inputs",
+                            "outputs"
+                        ]
+                    }
+                }
+            }
+        },
+        "actions": {
+            "Validate_request": {
+                "type": "ParseJson",
+                "inputs": {
+                    "content": "@triggerBody()",
+                    "schema": {
+                        "type": "object",
+                        "required": [
+                            "domains",
+                            "contactEmail",
+                            "deliveryMethod"
+                        ],
+                        "additionalProperties": false,
+                        "properties": {
+                            "domains": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "string",
+                                    "minLength": 1
+                                }
+                            },
+                            "contactEmail": {
+                                "type": "string",
+                                "minLength": 3
+                            },
+                            "keyspec": {
+                                "type": "string",
+                                "enum": [
+                                    "RSA:2048",
+                                    "RSA:4096"
+                                ]
+                            },
+                            "ip_sans": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                }
+                            },
+                            "comment": {
+                                "type": "string"
+                            },
+                            "deliveryMethod": {
+                                "type": "string",
+                                "enum": [
+                                    "email",
+                                    "download"
+                                ]
+                            }
+                        }
+                    }
+                },
+                "runAfter": {},
+                "runtimeConfiguration": {
+                    "secureData": {
+                        "properties": [
+                            "inputs"
+                        ]
+                    }
+                }
+            },
+            "Respond_invalid_request": {
+                "type": "Response",
+                "kind": "Http",
+                "inputs": {
+                    "statusCode": 400,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Cache-Control": "no-store",
+                        "Pragma": "no-cache"
+                    },
+                    "body": {
+                        "error": "invalid_request",
+                        "message": "The request must contain a nonempty domains array, contactEmail, and deliveryMethod set to email or download. Optional properties are keyspec, ip_sans, and comment.",
+                        "correlationId": "@workflow().run.name"
+                    }
+                },
+                "runAfter": {
+                    "Validate_request": [
+                        "Failed",
+                        "TimedOut"
+                    ]
+                }
+            },
+            "Process_order_contact_and_checkout": {
+                "type": "Scope",
+                "actions": {
+                    "Get_TrustView_API_key": {
+                        "type": "Http",
+                        "inputs": {
+                            "uri": "@concat('https://', appsetting('KeyVaultName'), '.vault.azure.net/secrets/', appsetting('TrustViewSecretName'), '?api-version=7.4')",
+                            "method": "GET",
+                            "authentication": {
+                                "type": "ManagedServiceIdentity",
+                                "audience": "https://vault.azure.net"
+                            },
+                            "retryPolicy": {
+                                "type": "exponential",
+                                "count": 3,
+                                "interval": "PT5S"
+                            }
+                        },
+                        "runtimeConfiguration": {
+                            "secureData": {
+                                "properties": [
+                                    "inputs",
+                                    "outputs"
+                                ]
+                            }
+                        }
+                    },
+                    "Compose_order_body": {
+                        "type": "Compose",
+                        "inputs": {
+                            "issuer": "ADCS",
+                            "type": "dv",
+                            "domains": "@body('Validate_request')?['domains']",
+                            "ip_sans": "@coalesce(body('Validate_request')?['ip_sans'], json('[]'))",
+                            "keyspec": "@coalesce(body('Validate_request')?['keyspec'], 'RSA:2048')",
+                            "adcstemplateoid": "@appsetting('TrustViewTemplateOid')",
+                            "comment": "@coalesce(body('Validate_request')?['comment'], 'Ordered through certificate API')"
+                        },
+                        "runAfter": {
+                            "Get_TrustView_API_key": [
+                                "Succeeded"
+                            ]
+                        }
+                    },
+                    "Place_TrustView_order": {
+                        "type": "Http",
+                        "inputs": {
+                            "uri": "@appsetting('TrustViewOrderUrl')",
+                            "method": "POST",
+                            "headers": {
+                                "Accept": "application/json",
+                                "Content-Type": "application/json",
+                                "X-TRUSTVIEW-APIKEY": "@trim(body('Get_TrustView_API_key')?['value'])"
+                            },
+                            "body": "@outputs('Compose_order_body')",
+                            "retryPolicy": {
+                                "type": "none"
+                            }
+                        },
+                        "runAfter": {
+                            "Compose_order_body": [
+                                "Succeeded"
+                            ]
+                        },
+                        "runtimeConfiguration": {
+                            "secureData": {
+                                "properties": [
+                                    "inputs",
+                                    "outputs"
+                                ]
+                            }
+                        }
+                    },
+                    "Check_order_created": {
+                        "type": "If",
+                        "expression": {
+                            "and": [
+                                {
+                                    "equals": [
+                                        "@outputs('Place_TrustView_order')?['statusCode']",
+                                        201
+                                    ]
+                                },
+                                {
+                                    "not": {
+                                        "equals": [
+                                            "@body('Place_TrustView_order')?['id']",
+                                            null
+                                        ]
+                                    }
+                                }
+                            ]
+                        },
+                        "actions": {
+                            "Wait_until_certificate_is_ready": {
+                                "type": "Until",
+                                "expression": "@and(equals(toLower(string(body('Get_certificate_status')?['status'])), 'active'), equals(body('Get_certificate_status')?['hasprivatekey'], true))",
+                                "limit": {
+                                    "count": 30,
+                                    "timeout": "PT5M"
+                                },
+                                "actions": {
+                                    "Get_certificate_status": {
+                                        "type": "Http",
+                                        "inputs": {
+                                            "uri": "@concat(replace(appsetting('TrustViewOrderUrl'), '/order', '/'), string(body('Place_TrustView_order')?['id']))",
+                                            "method": "GET",
+                                            "headers": {
+                                                "Accept": "application/json",
+                                                "X-TRUSTVIEW-APIKEY": "@trim(body('Get_TrustView_API_key')?['value'])"
+                                            },
+                                            "retryPolicy": {
+                                                "type": "none"
+                                            }
+                                        }
+                                    },
+                                    "Check_certificate_readiness": {
+                                        "type": "If",
+                                        "expression": {
+                                            "and": [
+                                                {
+                                                    "equals": [
+                                                        "@toLower(string(body('Get_certificate_status')?['status']))",
+                                                        "active"
+                                                    ]
+                                                },
+                                                {
+                                                    "equals": [
+                                                        "@body('Get_certificate_status')?['hasprivatekey']",
+                                                        true
+                                                    ]
+                                                }
+                                            ]
+                                        },
+                                        "actions": {},
+                                        "else": {
+                                            "actions": {
+                                                "Delay_before_next_status_check": {
+                                                    "type": "Wait",
+                                                    "inputs": {
+                                                        "interval": {
+                                                            "count": 10,
+                                                            "unit": "Second"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "runAfter": {
+                                            "Get_certificate_status": [
+                                                "Succeeded"
+                                            ]
+                                        }
+                                    }
+                                }
+                            },
+                            "Get_TrustView_contacts": {
+                                "type": "Http",
+                                "inputs": {
+                                    "uri": "@replace(appsetting('TrustViewOrderUrl'), '/api/v1/monitoredobject/monitoredsslcertificate/order', '/api/v1/contact')",
+                                    "method": "GET",
+                                    "headers": {
+                                        "Accept": "application/json",
+                                        "X-TRUSTVIEW-APIKEY": "@trim(body('Get_TrustView_API_key')?['value'])"
+                                    },
+                                    "retryPolicy": {
+                                        "type": "exponential",
+                                        "count": 3,
+                                        "interval": "PT5S"
+                                    }
+                                },
+                                "runAfter": {
+                                    "Wait_until_certificate_is_ready": [
+                                        "Succeeded"
+                                    ]
+                                }
+                            },
+                            "Filter_contact_by_email": {
+                                "type": "Query",
+                                "inputs": {
+                                    "from": "@coalesce(body('Get_TrustView_contacts')?['contacts'], json('[]'))",
+                                    "where": "@equals(toLower(trim(string(item()?['emailAddress']))), toLower(trim(string(body('Validate_request')?['contactEmail']))))"
+                                },
+                                "runAfter": {
+                                    "Get_TrustView_contacts": [
+                                        "Succeeded"
+                                    ]
+                                }
+                            },
+                            "Validate_contact_match": {
+                                "type": "If",
+                                "expression": {
+                                    "equals": [
+                                        "@length(body('Filter_contact_by_email'))",
+                                        1
+                                    ]
+                                },
+                                "actions": {
+                                    "Add_contact_to_certificate": {
+                                        "type": "Http",
+                                        "inputs": {
+                                            "uri": "@concat(replace(appsetting('TrustViewOrderUrl'), '/order', '/'), string(body('Place_TrustView_order')?['id']), '/externalcontact/', string(first(body('Filter_contact_by_email'))?['id']))",
+                                            "method": "PUT",
+                                            "headers": {
+                                                "Accept": "application/json",
+                                                "X-TRUSTVIEW-APIKEY": "@trim(body('Get_TrustView_API_key')?['value'])"
+                                            },
+                                            "retryPolicy": {
+                                                "type": "none"
+                                            }
+                                        }
+                                    },
+                                    "Generate_random_PFX_password": {
+                                        "type": "Compose",
+                                        "inputs": "@concat('Tv9!', substring(replace(guid(), '-', ''), 0, 12), '#', substring(replace(guid(), '-', ''), 0, 12), 'aZ')",
+                                        "runAfter": {
+                                            "Add_contact_to_certificate": [
+                                                "Succeeded"
+                                            ]
+                                        },
+                                        "runtimeConfiguration": {
+                                            "secureData": {
+                                                "properties": [
+                                                    "inputs"
+                                                ]
+                                            }
+                                        }
+                                    },
+                                    "Select_delivery_method": {
+                                        "type": "If",
+                                        "expression": {
+                                            "equals": [
+                                                "@toLower(body('Validate_request')?['deliveryMethod'])",
+                                                "email"
+                                            ]
+                                        },
+                                        "actions": {
+                                            "Email_PFX_and_password": {
+                                                "type": "Http",
+                                                "inputs": {
+                                                    "uri": "@concat(replace(appsetting('TrustViewOrderUrl'), '/order', '/'), string(body('Place_TrustView_order')?['id']), '/checkout')",
+                                                    "method": "POST",
+                                                    "headers": {
+                                                        "Accept": "application/json",
+                                                        "Content-Type": "application/json",
+                                                        "X-TRUSTVIEW-APIKEY": "@trim(body('Get_TrustView_API_key')?['value'])"
+                                                    },
+                                                    "body": {
+                                                        "method": "mail-mail",
+                                                        "format": "pfx",
+                                                        "password": "@outputs('Generate_random_PFX_password')",
+                                                        "comment": "Certificate and password delivery through Logic App",
+                                                        "exportprivatekey": true,
+                                                        "passwordrecipient": "@first(body('Filter_contact_by_email'))?['emailAddress']",
+                                                        "checkoutinfo": "@first(body('Filter_contact_by_email'))?['emailAddress']",
+                                                        "fullchainkeyrecipient": "@first(body('Filter_contact_by_email'))?['emailAddress']",
+                                                        "locale": "@coalesce(first(body('Filter_contact_by_email'))?['locale'], 'en_US')"
+                                                    },
+                                                    "retryPolicy": {
+                                                        "type": "none"
+                                                    }
+                                                },
+                                                "runtimeConfiguration": {
+                                                    "secureData": {
+                                                        "properties": [
+                                                            "inputs",
+                                                            "outputs"
+                                                        ]
+                                                    }
+                                                }
+                                            },
+                                            "Validate_email_delivery_request": {
+                                                "type": "If",
+                                                "expression": {
+                                                    "equals": [
+                                                        "@outputs('Email_PFX_and_password')?['statusCode']",
+                                                        200
+                                                    ]
+                                                },
+                                                "actions": {
+                                                    "Respond_email_delivery_requested": {
+                                                        "type": "Response",
+                                                        "kind": "Http",
+                                                        "inputs": {
+                                                            "statusCode": 200,
+                                                            "headers": {
+                                                                "Content-Type": "application/json",
+                                                                "Cache-Control": "no-store",
+                                                                "Pragma": "no-cache"
+                                                            },
+                                                            "body": {
+                                                                "id": "@body('Place_TrustView_order')?['id']",
+                                                                "format": "pfx",
+                                                                "keyLocation": "trustview",
+                                                                "contactDetails": {
+                                                                    "id": "@first(body('Filter_contact_by_email'))?['id']",
+                                                                    "fullName": "@first(body('Filter_contact_by_email'))?['fullname']",
+                                                                    "emailAddress": "@first(body('Filter_contact_by_email'))?['emailAddress']",
+                                                                    "phone": "@first(body('Filter_contact_by_email'))?['phone']",
+                                                                    "company": "@first(body('Filter_contact_by_email'))?['company']",
+                                                                    "locale": "@first(body('Filter_contact_by_email'))?['locale']",
+                                                                    "associationStatus": "added"
+                                                                },
+                                                                "certificateDetails": {
+                                                                    "id": "@body('Get_certificate_status')?['id']",
+                                                                    "name": "@body('Get_certificate_status')?['name']",
+                                                                    "status": "@body('Get_certificate_status')?['status']",
+                                                                    "subject": "@body('Get_certificate_status')?['subject']",
+                                                                    "issuer": "@body('Get_certificate_status')?['issuer']",
+                                                                    "serialNumber": "@body('Get_certificate_status')?['serial']",
+                                                                    "thumbprint": "@body('Get_certificate_status')?['thumbprint']",
+                                                                    "sha256Fingerprint": "@body('Get_certificate_status')?['certificatehashsha256']",
+                                                                    "signatureAlgorithm": "@body('Get_certificate_status')?['signaturealgorithms']",
+                                                                    "rsaKeySize": "@body('Get_certificate_status')?['rsakeysize']",
+                                                                    "hasPrivateKey": "@body('Get_certificate_status')?['hasprivatekey']",
+                                                                    "issuedTimestamp": "@body('Get_certificate_status')?['issuedtimestamp']",
+                                                                    "expiry": "@body('Get_certificate_status')?['expiry']",
+                                                                    "dateCreated": "@body('Get_certificate_status')?['datecreated']",
+                                                                    "domainsSecured": "@body('Get_certificate_status')?['domainssecuredbycertificate']",
+                                                                    "certificateTemplate": "@body('Get_certificate_status')?['certificatetemplatenamev2']",
+                                                                    "certificateAuthority": "@body('Get_certificate_status')?['certificationauthority']",
+                                                                    "certificateIssuerType": "@body('Get_certificate_status')?['certificateissuertype']",
+                                                                    "revocationStatus": "@body('Get_certificate_status')?['revocationstatus']",
+                                                                    "trustViewOrderId": "@body('Get_certificate_status')?['orderid']",
+                                                                    "origin": "@body('Get_certificate_status')?['origin']",
+                                                                    "comment": "@body('Get_certificate_status')?['comment']"
+                                                                },
+                                                                "correlationId": "@workflow().run.name",
+                                                                "status": "order_created_contact_added_and_delivery_requested",
+                                                                "delivery": {
+                                                                    "method": "mail-mail",
+                                                                    "certificateDelivery": "email",
+                                                                    "passwordDelivery": "separate_email",
+                                                                    "certificateRecipient": "@first(body('Filter_contact_by_email'))?['emailAddress']",
+                                                                    "passwordRecipient": "@first(body('Filter_contact_by_email'))?['emailAddress']",
+                                                                    "locale": "@coalesce(first(body('Filter_contact_by_email'))?['locale'], 'en_US')",
+                                                                    "requested": true
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                },
+                                                "else": {
+                                                    "actions": {
+                                                        "Respond_email_delivery_failed": {
+                                                            "type": "Response",
+                                                            "kind": "Http",
+                                                            "inputs": {
+                                                                "statusCode": 502,
+                                                                "headers": {
+                                                                    "Content-Type": "application/json",
+                                                                    "Cache-Control": "no-store",
+                                                                    "Pragma": "no-cache"
+                                                                },
+                                                                "body": {
+                                                                    "error": "certificate_delivery_failed",
+                                                                    "message": "TrustView did not accept the PFX and password email-delivery request.",
+                                                                    "certificateId": "@body('Place_TrustView_order')?['id']",
+                                                                    "upstreamStatus": "@outputs('Email_PFX_and_password')?['statusCode']",
+                                                                    "correlationId": "@workflow().run.name"
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                },
+                                                "runAfter": {
+                                                    "Email_PFX_and_password": [
+                                                        "Succeeded"
+                                                    ]
+                                                }
+                                            }
+                                        },
+                                        "else": {
+                                            "actions": {
+                                                "Download_PFX": {
+                                                    "type": "Http",
+                                                    "inputs": {
+                                                        "uri": "@concat(replace(appsetting('TrustViewOrderUrl'), '/order', '/'), string(body('Place_TrustView_order')?['id']), '/checkout')",
+                                                        "method": "POST",
+                                                        "headers": {
+                                                            "Accept": "application/json",
+                                                            "Content-Type": "application/json",
+                                                            "X-TRUSTVIEW-APIKEY": "@trim(body('Get_TrustView_API_key')?['value'])"
+                                                        },
+                                                        "body": {
+                                                            "method": "download",
+                                                            "format": "pfx",
+                                                            "password": "@outputs('Generate_random_PFX_password')",
+                                                            "comment": "Certificate and private-key checkout through Logic App",
+                                                            "exportprivatekey": true,
+                                                            "locale": "en_US"
+                                                        },
+                                                        "retryPolicy": {
+                                                            "type": "none"
+                                                        }
+                                                    },
+                                                    "runtimeConfiguration": {
+                                                        "secureData": {
+                                                            "properties": [
+                                                                "inputs",
+                                                                "outputs"
+                                                            ]
+                                                        }
+                                                    }
+                                                },
+                                                "Validate_download_result": {
+                                                    "type": "If",
+                                                    "expression": {
+                                                        "and": [
+                                                            {
+                                                                "equals": [
+                                                                    "@outputs('Download_PFX')?['statusCode']",
+                                                                    200
+                                                                ]
+                                                            },
+                                                            {
+                                                                "not": {
+                                                                    "equals": [
+                                                                        "@body('Download_PFX')?['fullchainkey_pfx']",
+                                                                        null
+                                                                    ]
+                                                                }
+                                                            },
+                                                            {
+                                                                "not": {
+                                                                    "equals": [
+                                                                        "@body('Download_PFX')?['fullchainkey_pfx']",
+                                                                        ""
+                                                                    ]
+                                                                }
+                                                            }
+                                                        ]
+                                                    },
+                                                    "actions": {
+                                                        "Respond_download_completed": {
+                                                            "type": "Response",
+                                                            "kind": "Http",
+                                                            "inputs": {
+                                                                "statusCode": 200,
+                                                                "headers": {
+                                                                    "Content-Type": "application/json",
+                                                                    "Cache-Control": "no-store",
+                                                                    "Pragma": "no-cache"
+                                                                },
+                                                                "body": {
+                                                                    "id": "@body('Place_TrustView_order')?['id']",
+                                                                    "format": "pfx",
+                                                                    "keyLocation": "trustview",
+                                                                    "contactDetails": {
+                                                                        "id": "@first(body('Filter_contact_by_email'))?['id']",
+                                                                        "fullName": "@first(body('Filter_contact_by_email'))?['fullname']",
+                                                                        "emailAddress": "@first(body('Filter_contact_by_email'))?['emailAddress']",
+                                                                        "phone": "@first(body('Filter_contact_by_email'))?['phone']",
+                                                                        "company": "@first(body('Filter_contact_by_email'))?['company']",
+                                                                        "locale": "@first(body('Filter_contact_by_email'))?['locale']",
+                                                                        "associationStatus": "added"
+                                                                    },
+                                                                    "certificateDetails": {
+                                                                        "id": "@body('Get_certificate_status')?['id']",
+                                                                        "name": "@body('Get_certificate_status')?['name']",
+                                                                        "status": "@body('Get_certificate_status')?['status']",
+                                                                        "subject": "@body('Get_certificate_status')?['subject']",
+                                                                        "issuer": "@body('Get_certificate_status')?['issuer']",
+                                                                        "serialNumber": "@body('Get_certificate_status')?['serial']",
+                                                                        "thumbprint": "@body('Get_certificate_status')?['thumbprint']",
+                                                                        "sha256Fingerprint": "@body('Get_certificate_status')?['certificatehashsha256']",
+                                                                        "signatureAlgorithm": "@body('Get_certificate_status')?['signaturealgorithms']",
+                                                                        "rsaKeySize": "@body('Get_certificate_status')?['rsakeysize']",
+                                                                        "hasPrivateKey": "@body('Get_certificate_status')?['hasprivatekey']",
+                                                                        "issuedTimestamp": "@body('Get_certificate_status')?['issuedtimestamp']",
+                                                                        "expiry": "@body('Get_certificate_status')?['expiry']",
+                                                                        "dateCreated": "@body('Get_certificate_status')?['datecreated']",
+                                                                        "domainsSecured": "@body('Get_certificate_status')?['domainssecuredbycertificate']",
+                                                                        "certificateTemplate": "@body('Get_certificate_status')?['certificatetemplatenamev2']",
+                                                                        "certificateAuthority": "@body('Get_certificate_status')?['certificationauthority']",
+                                                                        "certificateIssuerType": "@body('Get_certificate_status')?['certificateissuertype']",
+                                                                        "revocationStatus": "@body('Get_certificate_status')?['revocationstatus']",
+                                                                        "trustViewOrderId": "@body('Get_certificate_status')?['orderid']",
+                                                                        "origin": "@body('Get_certificate_status')?['origin']",
+                                                                        "comment": "@body('Get_certificate_status')?['comment']"
+                                                                    },
+                                                                    "correlationId": "@workflow().run.name",
+                                                                    "status": "order_created_contact_added_and_downloaded",
+                                                                    "delivery": {
+                                                                        "method": "download",
+                                                                        "requested": true
+                                                                    },
+                                                                    "pfxBase64": "@body('Download_PFX')?['fullchainkey_pfx']",
+                                                                    "pfxPassword": "@outputs('Generate_random_PFX_password')"
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                    "else": {
+                                                        "actions": {
+                                                            "Respond_download_failed": {
+                                                                "type": "Response",
+                                                                "kind": "Http",
+                                                                "inputs": {
+                                                                    "statusCode": 502,
+                                                                    "headers": {
+                                                                        "Content-Type": "application/json",
+                                                                        "Cache-Control": "no-store",
+                                                                        "Pragma": "no-cache"
+                                                                    },
+                                                                    "body": {
+                                                                        "error": "certificate_download_failed",
+                                                                        "message": "TrustView download did not return HTTP 200 with fullchainkey_pfx.",
+                                                                        "certificateId": "@body('Place_TrustView_order')?['id']",
+                                                                        "upstreamStatus": "@outputs('Download_PFX')?['statusCode']",
+                                                                        "correlationId": "@workflow().run.name"
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                    "runAfter": {
+                                                        "Download_PFX": [
+                                                            "Succeeded"
+                                                        ]
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "runAfter": {
+                                            "Generate_random_PFX_password": [
+                                                "Succeeded"
+                                            ]
+                                        }
+                                    }
+                                },
+                                "else": {
+                                    "actions": {
+                                        "Respond_contact_not_found_or_ambiguous": {
+                                            "type": "Response",
+                                            "kind": "Http",
+                                            "inputs": {
+                                                "statusCode": 422,
+                                                "headers": {
+                                                    "Content-Type": "application/json",
+                                                    "Cache-Control": "no-store",
+                                                    "Pragma": "no-cache"
+                                                },
+                                                "body": {
+                                                    "error": "contact_match_failed",
+                                                    "message": "@if(equals(length(body('Filter_contact_by_email')), 0), 'No TrustView contact matched the supplied email address.', 'More than one TrustView contact matched the supplied email address.')",
+                                                    "contactEmail": "@body('Validate_request')?['contactEmail']",
+                                                    "matchCount": "@length(body('Filter_contact_by_email'))",
+                                                    "certificateId": "@body('Place_TrustView_order')?['id']",
+                                                    "certificateStatus": "@body('Get_certificate_status')?['status']",
+                                                    "correlationId": "@workflow().run.name"
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                "runAfter": {
+                                    "Filter_contact_by_email": [
+                                        "Succeeded"
+                                    ]
+                                }
+                            }
+                        },
+                        "else": {
+                            "actions": {
+                                "Respond_unexpected_order_result": {
+                                    "type": "Response",
+                                    "kind": "Http",
+                                    "inputs": {
+                                        "statusCode": 502,
+                                        "headers": {
+                                            "Content-Type": "application/json",
+                                            "Cache-Control": "no-store",
+                                            "Pragma": "no-cache"
+                                        },
+                                        "body": {
+                                            "error": "unexpected_order_response",
+                                            "message": "TrustView did not return HTTP 201 with an order ID. Check TrustView before retrying because an order might have been created.",
+                                            "upstreamStatus": "@outputs('Place_TrustView_order')?['statusCode']",
+                                            "correlationId": "@workflow().run.name"
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "runAfter": {
+                            "Place_TrustView_order": [
+                                "Succeeded"
+                            ]
+                        }
+                    }
+                },
+                "runAfter": {
+                    "Validate_request": [
+                        "Succeeded"
+                    ]
+                }
+            },
+            "Respond_workflow_failure": {
+                "type": "Response",
+                "kind": "Http",
+                "inputs": {
+                    "statusCode": 502,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Cache-Control": "no-store",
+                        "Pragma": "no-cache"
+                    },
+                    "body": {
+                        "error": "certificate_workflow_failed",
+                        "message": "The workflow failed during API-key retrieval, certificate ordering, readiness validation, contact lookup, contact association, password generation, email delivery, or PFX download. Review the failed action in the Logic App run history.",
+                        "correlationId": "@workflow().run.name"
+                    }
+                },
+                "runAfter": {
+                    "Process_order_contact_and_checkout": [
+                        "Failed",
+                        "TimedOut"
+                    ]
+                }
+            }
+        },
+        "outputs": {},
+        "parameters": {}
+    },
+    "kind": "Stateful"
+}
