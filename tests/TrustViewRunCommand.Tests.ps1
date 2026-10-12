@@ -1,7 +1,8 @@
 BeforeAll {
     $root = Split-Path $PSScriptRoot -Parent
     . (Join-Path $root 'Invoke-TrustViewOrder.ps1') -RequestBase64 'unused-when-dot-sourced'
-    $template = Get-Content (Join-Path $root 'Trustview_Order_Checkout_RunCommand.json') -Raw | ConvertFrom-Json
+    $workflow = Get-Content (Join-Path $root 'Trustview_Order_Checkout_RunCommand.json') -Raw | ConvertFrom-Json
+    $template = Get-Content (Join-Path $root 'Trustview_Order_Checkout_RunCommand.arm.json') -Raw | ConvertFrom-Json
     $original = Get-Content (Join-Path $root 'Trustview_Order_Checkout.json') -Raw | ConvertFrom-Json
     $configuration = @{
         OrderUrl = 'https://trustview.internal/api/v1/monitoredobject/monitoredsslcertificate/order'
@@ -238,6 +239,37 @@ Describe 'Secure result transport' {
 }
 
 Describe 'Consumption workflow contract' {
+    It 'uses the Code View envelope rather than an ARM deployment template' {
+        @($workflow.PSObject.Properties.Name).Count | Should -Be 2
+        $workflow.PSObject.Properties.Name | Should -Contain 'definition'
+        $workflow.PSObject.Properties.Name | Should -Contain 'parameters'
+        $workflow.definition.'$schema' | Should -Be (
+            'https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#'
+        )
+        ($workflow | ConvertTo-Json -Depth 100) | Should -Not -Match (
+            '"defaultValue"|"workflowName"|"resources"|\[parameters\(|\[resourceGroup\(|\[subscription\(|\[format\('
+        )
+    }
+
+    It 'provides a literal runtime value for every declared workflow parameter' {
+        @($workflow.parameters.PSObject.Properties.Name).Count |
+            Should -Be @($workflow.definition.parameters.PSObject.Properties.Name).Count
+        foreach ($parameter in $workflow.definition.parameters.PSObject.Properties) {
+            $workflow.definition.parameters.($parameter.Name).type | Should -Be 'String'
+            $runtimeParameter = $workflow.parameters.($parameter.Name)
+            @($runtimeParameter.PSObject.Properties.Name).Count | Should -Be 1
+            $runtimeParameter.PSObject.Properties.Name | Should -Contain 'value'
+            $runtimeParameter.value | Should -BeOfType [string]
+            $runtimeParameter.value | Should -Not -BeNullOrEmpty
+            $runtimeParameter.value | Should -Not -Match '^\[|^@'
+        }
+    }
+
+    It 'preserves the complete ARM workflow definition in Code View' {
+        $workflow.definition | ConvertTo-Json -Depth 100 -Compress |
+            Should -Be ($template.resources[0].properties.definition | ConvertTo-Json -Depth 100 -Compress)
+    }
+
     It 'deploys a Consumption resource with an assigned identity and a required caller allowlist' {
         $template.resources[0].type | Should -Be 'Microsoft.Logic/workflows'
         $template.resources[0].identity.type | Should -Be 'SystemAssigned'

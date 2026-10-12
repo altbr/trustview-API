@@ -1,0 +1,394 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workflowName": {
+            "type": "string",
+            "defaultValue": "Trustview-Order-RunCommand"
+        },
+        "location": {
+            "type": "string",
+            "defaultValue": "[resourceGroup().location]"
+        },
+        "vmSubscriptionId": {
+            "type": "string",
+            "defaultValue": "[subscription().subscriptionId]"
+        },
+        "vmResourceGroup": {
+            "type": "string"
+        },
+        "vmLocation": {
+            "type": "string"
+        },
+        "resultsStorageAccountName": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 24
+        },
+        "resultsContainerName": {
+            "type": "string",
+            "defaultValue": "trustview-results"
+        },
+        "allowedCallerIpRanges": {
+            "type": "array",
+            "minLength": 1,
+            "metadata": {
+                "description": "Approved caller ranges as objects with an addressRange property. Do not use 0.0.0.0/0."
+            }
+        }
+    },
+    "resources": [
+        {
+            "type": "Microsoft.Logic/workflows",
+            "apiVersion": "2019-05-01",
+            "name": "[parameters('workflowName')]",
+            "location": "[parameters('location')]",
+            "identity": {
+                "type": "SystemAssigned"
+            },
+            "properties": {
+                "state": "Enabled",
+                "accessControl": {
+                    "triggers": {
+                        "allowedCallerIpAddresses": "[parameters('allowedCallerIpRanges')]"
+                    }
+                },
+                "parameters": {
+                    "VmSubscriptionId": {
+                        "value": "[parameters('vmSubscriptionId')]"
+                    },
+                    "VmResourceGroup": {
+                        "value": "[parameters('vmResourceGroup')]"
+                    },
+                    "VmLocation": {
+                        "value": "[parameters('vmLocation')]"
+                    },
+                    "ResultsBlobServiceUri": {
+                        "value": "[format('https://{0}.blob.core.windows.net', parameters('resultsStorageAccountName'))]"
+                    },
+                    "ResultsContainerName": {
+                        "value": "[parameters('resultsContainerName')]"
+                    }
+                },
+                "definition": {
+                    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+                    "contentVersion": "1.0.0.0",
+                    "parameters": {
+                        "VmSubscriptionId": { "type": "String" },
+                        "VmResourceGroup": { "type": "String" },
+                        "VmLocation": { "type": "String" },
+                        "ResultsBlobServiceUri": { "type": "String" },
+                        "ResultsContainerName": { "type": "String" }
+                    },
+                    "triggers": {
+                        "When_an_HTTP_request_is_received": {
+                            "type": "Request",
+                            "kind": "Http",
+                            "inputs": {
+                                "method": "POST",
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["domains", "contactEmail", "deliveryMethod"],
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "domains": {
+                                            "type": "array",
+                                            "minItems": 1,
+                                            "items": { "type": "string", "minLength": 1 }
+                                        },
+                                        "contactEmail": { "type": "string", "minLength": 3 },
+                                        "keyspec": {
+                                            "type": "string",
+                                            "enum": ["RSA:2048", "RSA:4096"]
+                                        },
+                                        "ip_sans": {
+                                            "type": "array",
+                                            "items": { "type": "string" }
+                                        },
+                                        "comment": { "type": "string" },
+                                        "deliveryMethod": {
+                                            "type": "string",
+                                            "enum": ["email", "download"]
+                                        }
+                                    }
+                                }
+                            },
+                            "runtimeConfiguration": {
+                                "concurrency": { "runs": 1 },
+                                "secureData": { "properties": ["inputs", "outputs"] }
+                            }
+                        }
+                    },
+                    "actions": {
+                        "Validate_request": {
+                            "type": "ParseJson",
+                            "inputs": {
+                                "content": "@triggerBody()",
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["domains", "contactEmail", "deliveryMethod"],
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "domains": {
+                                            "type": "array",
+                                            "minItems": 1,
+                                            "items": { "type": "string", "minLength": 1 }
+                                        },
+                                        "contactEmail": { "type": "string", "minLength": 3 },
+                                        "keyspec": {
+                                            "type": "string",
+                                            "enum": ["RSA:2048", "RSA:4096"]
+                                        },
+                                        "ip_sans": {
+                                            "type": "array",
+                                            "items": { "type": "string" }
+                                        },
+                                        "comment": { "type": "string" },
+                                        "deliveryMethod": {
+                                            "type": "string",
+                                            "enum": ["email", "download"]
+                                        }
+                                    }
+                                }
+                            },
+                            "runAfter": {},
+                            "runtimeConfiguration": {
+                                "secureData": { "properties": ["inputs"] }
+                            }
+                        },
+                        "Respond_invalid_request": {
+                            "type": "Response",
+                            "kind": "Http",
+                            "operationOptions": "Asynchronous",
+                            "inputs": {
+                                "statusCode": 400,
+                                "headers": {
+                                    "Content-Type": "application/json",
+                                    "Cache-Control": "no-store",
+                                    "Pragma": "no-cache"
+                                },
+                                "body": {
+                                    "error": "invalid_request",
+                                    "message": "Provide domains, contactEmail, and deliveryMethod set to email or download.",
+                                    "correlationId": "@workflow().run.name"
+                                }
+                            },
+                            "runAfter": {
+                                "Validate_request": ["Failed", "TimedOut"]
+                            }
+                        },
+                        "Run_private_TrustView_order": {
+                            "type": "Scope",
+                            "actions": {
+                                "Submit_VM_Run_Command": {
+                                    "type": "Http",
+                                    "operationOptions": "DisableAsyncPattern",
+                                    "inputs": {
+                                        "uri": "@concat('https://management.azure.com/subscriptions/', parameters('VmSubscriptionId'), '/resourceGroups/', parameters('VmResourceGroup'), '/providers/Microsoft.Compute/virtualMachines/dkmant0-01/runCommands/', workflow().run.name, '?api-version=2024-11-01')",
+                                        "method": "PUT",
+                                        "authentication": {
+                                            "type": "ManagedServiceIdentity",
+                                            "audience": "https://management.azure.com/"
+                                        },
+                                        "headers": { "Content-Type": "application/json" },
+                                        "body": {
+                                            "location": "@parameters('VmLocation')",
+                                            "properties": {
+                                                "source": {
+                                                    "script": "param([string]$RequestBase64)\n$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\ntry {\n    & 'C:\\TrustView\\Invoke-TrustViewOrder.ps1' -RequestBase64 $RequestBase64 *> $null\n    Write-Output 'TrustView worker finished.'\n} catch {\n    throw 'TrustView worker failed; check VM configuration and permissions.'\n}"
+                                                },
+                                                "parameters": [
+                                                    {
+                                                        "name": "RequestBase64",
+                                                        "value": "@base64(string(addProperty(body('Validate_request'), 'correlationId', workflow().run.name)))"
+                                                    }
+                                                ],
+                                                "asyncExecution": true,
+                                                "timeoutInSeconds": 600
+                                            }
+                                        },
+                                        "retryPolicy": { "type": "none" }
+                                    },
+                                    "runAfter": {},
+                                    "runtimeConfiguration": {
+                                        "secureData": { "properties": ["inputs", "outputs"] }
+                                    }
+                                },
+                                "Wait_for_VM_result": {
+                                    "type": "Until",
+                                    "expression": "@not(equals(outputs('Get_VM_result')?['statusCode'], 404))",
+                                    "operationOptions": "FailWhenLimitsReached",
+                                    "limit": { "count": 90, "timeout": "PT20M" },
+                                    "actions": {
+                                        "Get_VM_result": {
+                                            "type": "Http",
+                                            "inputs": {
+                                                "uri": "@concat(parameters('ResultsBlobServiceUri'), '/', parameters('ResultsContainerName'), '/', workflow().run.name, '.json')",
+                                                "method": "GET",
+                                                "headers": {
+                                                    "x-ms-version": "2023-11-03",
+                                                    "x-ms-date": "@formatDateTime(utcNow(), 'R')"
+                                                },
+                                                "authentication": {
+                                                    "type": "ManagedServiceIdentity",
+                                                    "audience": "https://storage.azure.com/"
+                                                },
+                                                "retryPolicy": { "type": "none" }
+                                            },
+                                            "runAfter": {},
+                                            "runtimeConfiguration": {
+                                                "secureData": { "properties": ["inputs", "outputs"] }
+                                            }
+                                        },
+                                        "Delay_before_next_result_check": {
+                                            "type": "Wait",
+                                            "inputs": {
+                                                "interval": { "count": 10, "unit": "Second" }
+                                            },
+                                            "runAfter": {
+                                                "Get_VM_result": ["Succeeded", "Failed", "TimedOut"]
+                                            }
+                                        }
+                                    },
+                                    "runAfter": {
+                                        "Submit_VM_Run_Command": ["Succeeded"]
+                                    }
+                                },
+                                "Parse_VM_result": {
+                                    "type": "ParseJson",
+                                    "inputs": {
+                                        "content": "@if(and(equals(outputs('Get_VM_result')?['statusCode'], 200), equals(body('Get_VM_result')?['body']?['correlationId'], workflow().run.name)), body('Get_VM_result'), json('{}'))",
+                                        "schema": {
+                                            "type": "object",
+                                            "required": ["statusCode", "body"],
+                                            "additionalProperties": false,
+                                            "properties": {
+                                                "statusCode": {
+                                                    "type": "integer",
+                                                    "enum": [200, 400, 422, 502, 504]
+                                                },
+                                                "body": {
+                                                    "type": "object",
+                                                    "required": ["correlationId"],
+                                                    "properties": {
+                                                        "correlationId": { "type": "string" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "runAfter": {
+                                        "Wait_for_VM_result": ["Succeeded"]
+                                    },
+                                    "runtimeConfiguration": {
+                                        "secureData": { "properties": ["inputs"] }
+                                    }
+                                }
+                            },
+                            "runAfter": {
+                                "Validate_request": ["Succeeded"]
+                            }
+                        },
+                        "Cleanup_remote_artifacts": {
+                            "type": "Scope",
+                            "actions": {
+                                "Delete_VM_Run_Command": {
+                                    "type": "Http",
+                                    "operationOptions": "DisableAsyncPattern",
+                                    "inputs": {
+                                        "uri": "@concat('https://management.azure.com/subscriptions/', parameters('VmSubscriptionId'), '/resourceGroups/', parameters('VmResourceGroup'), '/providers/Microsoft.Compute/virtualMachines/dkmant0-01/runCommands/', workflow().run.name, '?api-version=2024-11-01')",
+                                        "method": "DELETE",
+                                        "authentication": {
+                                            "type": "ManagedServiceIdentity",
+                                            "audience": "https://management.azure.com/"
+                                        },
+                                        "retryPolicy": { "type": "none" }
+                                    },
+                                    "runAfter": {},
+                                    "runtimeConfiguration": {
+                                        "secureData": { "properties": ["inputs", "outputs"] }
+                                    }
+                                },
+                                "Delete_VM_result": {
+                                    "type": "Http",
+                                    "operationOptions": "DisableAsyncPattern",
+                                    "inputs": {
+                                        "uri": "@concat(parameters('ResultsBlobServiceUri'), '/', parameters('ResultsContainerName'), '/', workflow().run.name, '.json')",
+                                        "method": "DELETE",
+                                        "headers": {
+                                            "x-ms-version": "2023-11-03",
+                                            "x-ms-date": "@formatDateTime(utcNow(), 'R')",
+                                            "x-ms-delete-snapshots": "include"
+                                        },
+                                        "authentication": {
+                                            "type": "ManagedServiceIdentity",
+                                            "audience": "https://storage.azure.com/"
+                                        },
+                                        "retryPolicy": { "type": "none" }
+                                    },
+                                    "runAfter": {
+                                        "Delete_VM_Run_Command": ["Succeeded", "Failed", "TimedOut"]
+                                    },
+                                    "runtimeConfiguration": {
+                                        "secureData": { "properties": ["inputs", "outputs"] }
+                                    }
+                                }
+                            },
+                            "runAfter": {
+                                "Run_private_TrustView_order": ["Succeeded", "Failed", "TimedOut"]
+                            }
+                        },
+                        "Respond_VM_result": {
+                            "type": "Response",
+                            "kind": "Http",
+                            "operationOptions": "Asynchronous",
+                            "inputs": {
+                                "statusCode": "@body('Parse_VM_result')?['statusCode']",
+                                "headers": {
+                                    "Content-Type": "application/json",
+                                    "Cache-Control": "no-store",
+                                    "Pragma": "no-cache"
+                                },
+                                "body": "@body('Parse_VM_result')?['body']"
+                            },
+                            "runAfter": {
+                                "Run_private_TrustView_order": ["Succeeded"]
+                            },
+                            "runtimeConfiguration": {
+                                "secureData": { "properties": ["inputs"] }
+                            }
+                        },
+                        "Respond_remote_failure": {
+                            "type": "Response",
+                            "kind": "Http",
+                            "operationOptions": "Asynchronous",
+                            "inputs": {
+                                "statusCode": 502,
+                                "headers": {
+                                    "Content-Type": "application/json",
+                                    "Cache-Control": "no-store",
+                                    "Pragma": "no-cache"
+                                },
+                                "body": {
+                                    "error": "remote_certificate_workflow_failed",
+                                    "message": "VM execution or result retrieval failed. Check TrustView before retrying because an order might have been created.",
+                                    "correlationId": "@workflow().run.name"
+                                }
+                            },
+                            "runAfter": {
+                                "Run_private_TrustView_order": ["Failed", "TimedOut"]
+                            }
+                        }
+                    },
+                    "outputs": {}
+                }
+            }
+        }
+    ],
+    "outputs": {
+        "workflowResourceId": {
+            "type": "string",
+            "value": "[resourceId('Microsoft.Logic/workflows', parameters('workflowName'))]"
+        }
+    }
+}

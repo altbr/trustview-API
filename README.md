@@ -3,9 +3,11 @@
 ## Private API access through dkmant0-01
 
 `Trustview_Order_Checkout.json` is the existing Standard Logic App workflow and
-is unchanged. `Trustview_Order_Checkout_RunCommand.json` is an ARM template for
-a separate **Consumption** Logic App. It accepts the same certificate request,
-but all TrustView calls run on **dkmant0-01**, not in the Logic App:
+is unchanged. `Trustview_Order_Checkout_RunCommand.json` can be pasted directly
+into a **Consumption** Logic App's **Logic app code view**. The optional ARM
+deployment template is `Trustview_Order_Checkout_RunCommand.arm.json`. Both
+versions accept the same certificate request, but all TrustView calls run on
+**dkmant0-01**, not in the Logic App:
 
 1. The Logic App validates the request and uses its managed identity to create
    a managed Azure VM Run Command on the fixed VM.
@@ -52,7 +54,7 @@ Storage Blob Data Contributor at container scope works for initial deployment,
 but grants more access than these custom roles.
 
 Run Command write permission allows arbitrary privileged execution on that VM,
-even though this template submits only a fixed worker invocation. Protect the
+even though this workflow submits only a fixed worker invocation. Protect the
 Logic App identity, workflow editing permissions, and VM administrators
 accordingly. Do not assign subscription-wide VM Contributor or Owner.
 
@@ -106,11 +108,45 @@ Set these **machine-level** environment variables on the VM:
 Use `[Environment]::SetEnvironmentVariable('<name>', '<value>', 'Machine')` in
 an administrator PowerShell session. The worker reads machine settings directly;
 do not set only your interactive user's environment. No API key is stored in
-these settings. This template and worker target the Azure public cloud.
+these settings. Both workflow versions and the worker target the Azure public cloud.
 
-### Deploy the Consumption template
+### Publish through Logic App Code View
 
-Deploy `Trustview_Order_Checkout_RunCommand.json` as an ARM resource-group
+1. Create or open a **Consumption** Logic App in Azure Portal. Keep it disabled
+   until the worker, identity permissions, networking, and caller restrictions
+   are configured.
+2. Under **Identity**, enable the **System assigned** identity and save. Assign
+   the Logic App and VM permissions from the table above.
+3. Under **Workflow settings**, configure the trigger's allowed inbound IP
+   addresses to include only approved caller ranges. Do not allow `0.0.0.0/0`.
+   Code View does **not** configure this resource-level access control or the
+   managed identity.
+4. Open **Logic app code view** and replace its contents with the entire
+   `Trustview_Order_Checkout_RunCommand.json` file.
+5. Replace the placeholder strings in the **top-level `parameters`** section
+   using the values below, then **Save**.
+6. Confirm the VM worker and all prerequisites are ready before enabling the
+   Logic App and sending a test request.
+
+| Runtime parameter | Value to supply |
+| --- | --- |
+| `VmSubscriptionId` | Subscription ID containing `dkmant0-01` |
+| `VmResourceGroup` | Resource group containing `dkmant0-01` |
+| `VmLocation` | VM's region, such as `westeurope`, not necessarily the Logic App region |
+| `ResultsBlobServiceUri` | `https://<storage-account>.blob.core.windows.net` without a trailing slash |
+| `ResultsContainerName` | Existing result container; defaults to `trustview-results` |
+
+The result store must match the VM's machine-level settings. The JSON contains
+only `definition` and runtime `parameters` with **`value`** entries. Keep the
+parameter type declarations inside `definition.parameters`. Do not paste ARM
+fields such as `resources`, `workflowName`, or deployment parameter
+`defaultValue` into Code View: they cause the reported `FlowTemplateParameter`
+save error. Code View does not create resources, install the worker, or assign
+permissions.
+
+### Optional ARM deployment
+
+Deploy `Trustview_Order_Checkout_RunCommand.arm.json` as an ARM resource-group
 deployment, supplying:
 
 - `vmResourceGroup`: resource group containing `dkmant0-01`.
@@ -127,10 +163,13 @@ the VM, Key Vault, container, role definitions/assignments, or install the
 worker. After deployment, assign the identity permissions above and allow time
 for RBAC propagation before sending requests.
 
+Do not paste the `.arm.json` file into Logic App Code View.
+
 Retrieve the Request trigger's callback URL through your normal secured Azure
 deployment process. Treat its signature and asynchronous polling URLs as
 credentials; do not commit them or include them in logs. The required IP
-allowlist adds a network restriction, not user-level authorization. Configure
+allowlist (configured separately for Code View) adds a network restriction,
+not user-level authorization. Configure
 Entra ID authorization or an authenticated gateway if callers need individual
 authorization rather than a shared signed callback URL.
 
@@ -200,7 +239,9 @@ Invoke-ScriptAnalyzer -Path ./Invoke-TrustViewOrder.ps1 -Severity Error,Warning
 Tests mock network calls; they cover request validation, injection-safe data
 handling, readiness limits, contact matching, email/download behavior, error
 redaction, large PFX transport, and the workflow contract. They do not replace
-an Azure deployment test. Validate the ARM deployment in your subscription,
+an Azure deployment test. They also check the Code View envelope, literal
+runtime parameters, and parity with the ARM workflow definition. Save the
+Code View version or validate the optional ARM deployment in your subscription,
 then exercise email and download requests against a test ADCS template,
 including missing contacts, delayed issuance, denied permissions, and cleanup.
 
