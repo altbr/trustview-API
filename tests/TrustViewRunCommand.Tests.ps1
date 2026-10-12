@@ -57,6 +57,169 @@ Describe 'Request validation' {
     }
 }
 
+Describe 'Arc managed identity' {
+    BeforeEach {
+        $identityEndpoint = 'http://localhost:40342/metadata/identity/oauth2/token'
+        Mock Invoke-TrustViewIdentityRequest {
+            param($Authorization)
+            if ($Authorization) { return @{ StatusCode = 200; Token = 'test-only-access-token' } }
+            return @{ StatusCode = 401; Challenge = 'Basic realm=challenge.key' }
+        }
+        Mock Get-TrustViewArcChallengeSecret { 'test-only-challenge-secret' }
+    }
+
+    It 'performs the authenticated challenge flow for <Resource>' -ForEach @(
+        @{ Resource = 'https://vault.azure.net' }
+        @{ Resource = 'https://storage.azure.com/' }
+    ) {
+        $output = @(Get-TrustViewManagedIdentityToken -Resource $Resource -IdentityEndpoint $identityEndpoint)
+        $output.Count | Should -Be 1
+        $output[0] | Should -Be 'test-only-access-token'
+        $expectedUri = $identityEndpoint + '?api-version=2020-06-01&resource=' + [uri]::EscapeDataString($Resource)
+        Should -Invoke Invoke-TrustViewIdentityRequest -Times 1 -Exactly -ParameterFilter {
+            $Uri -ceq $expectedUri -and -not $Authorization
+        }
+        Should -Invoke Get-TrustViewArcChallengeSecret -Times 1 -Exactly -ParameterFilter {
+            $Challenge -ceq 'Basic realm=challenge.key'
+        }
+        Should -Invoke Invoke-TrustViewIdentityRequest -Times 1 -Exactly -ParameterFilter {
+            $Uri -ceq $expectedUri -and $Authorization -ceq 'Basic test-only-challenge-secret'
+        }
+    }
+
+    It 'fails closed for endpoint <Endpoint>' -ForEach @(
+        @{ Endpoint = '' }
+        @{ Endpoint = 'http://169.254.169.254/metadata/identity/oauth2/token' }
+        @{ Endpoint = 'https://example.invalid/metadata/identity/oauth2/token' }
+        @{ Endpoint = 'http://localhost:40342/metadata/identity/oauth2/token?extra=true' }
+    ) {
+        { Get-TrustViewManagedIdentityToken -Resource 'https://vault.azure.net' -IdentityEndpoint $Endpoint } |
+            Should -Throw 'Arc managed identity token acquisition failed.*'
+        Should -Invoke Invoke-TrustViewIdentityRequest -Times 0
+    }
+
+    It 'rejects a non-challenge response without reading a file or sending authorization' {
+        Mock Invoke-TrustViewIdentityRequest { @{ StatusCode = 302; Challenge = 'Basic realm=challenge.key' } }
+        { Get-TrustViewManagedIdentityToken -Resource 'https://vault.azure.net' -IdentityEndpoint $identityEndpoint } |
+            Should -Throw 'Arc managed identity token acquisition failed.*'
+        Should -Invoke Get-TrustViewArcChallengeSecret -Times 0
+        Should -Invoke Invoke-TrustViewIdentityRequest -Times 1 -Exactly
+    }
+
+    It 'rejects an invalid authenticated response <Name>' -ForEach @(
+        @{ Name = 'unauthorized'; Status = 401; Token = 'test-only-access-token' }
+        @{ Name = 'empty token'; Status = 200; Token = '' }
+        @{ Name = 'non-string token'; Status = 200; Token = @('test-only-access-token') }
+    ) {
+        Mock Invoke-TrustViewIdentityRequest {
+            @{ StatusCode = $Status; Token = $Token }
+        } -ParameterFilter { $Authorization }
+        { Get-TrustViewManagedIdentityToken -Resource 'https://vault.azure.net' -IdentityEndpoint $identityEndpoint } |
+            Should -Throw 'Arc managed identity token acquisition failed.*'
+        Should -Invoke Invoke-TrustViewIdentityRequest -Times 2 -Exactly
+    }
+
+    It 'redacts challenge, file-access, and transport errors from <Function>' -ForEach @(
+        @{ Function = 'Invoke-TrustViewIdentityRequest' }
+        @{ Function = 'Get-TrustViewArcChallengeSecret' }
+    ) {
+        Mock -CommandName $Function { throw 'test-only-challenge-secret upstream-sensitive-details' }
+        $failure = $null
+        try { Get-TrustViewManagedIdentityToken -Resource 'https://vault.azure.net' -IdentityEndpoint $identityEndpoint }
+        catch { $failure = $_ }
+        $failure | Should -Not -BeNullOrEmpty
+        ($failure | Out-String) | Should -Not -Match 'test-only-challenge-secret|upstream-sensitive-details'
+    }
+
+    It 'bypasses proxies and disallows redirects on both HIMDS requests' {
+        $transport = ${function:Invoke-TrustViewIdentityRequest}.ToString()
+        $transport | Should -Match '\.Proxy = \$null'
+        $transport | Should -Match '\.AllowAutoRedirect = \$false'
+        $transport | Should -Match '\.Timeout = 30000'
+        $transport | Should -Match '\.ReadWriteTimeout = 30000'
+        $transport | Should -Match "Headers.Add\('Metadata', 'true'\)"
+    }
+}
+
+Describe 'Arc challenge-file validation' {
+    BeforeEach {
+        $tokenDirectory = Join-Path $TestDrive 'Tokens'
+        $null = New-Item -ItemType Directory -Path $tokenDirectory -Force
+        $tokenPath = Join-Path $tokenDirectory 'challenge.key'
+        Set-Content -LiteralPath $tokenPath -Value 'test-only-challenge-secret'
+    }
+
+    It 'reads a direct token file with <Quoted> quoting' -ForEach @(
+        @{ Quoted = $false }
+        @{ Quoted = $true }
+    ) {
+        $challenge = 'Basic realm=' + $tokenPath
+        if ($Quoted) { $challenge = 'Basic realm="' + $tokenPath + '"' }
+        Get-TrustViewArcChallengeSecret -Challenge $challenge -TokenDirectory $tokenDirectory |
+            Should -Be 'test-only-challenge-secret'
+    }
+
+    It 'rejects malformed challenge <Challenge>' -ForEach @(
+        @{ Challenge = '******' }
+        @{ Challenge = 'Basic realm=challenge.key' }
+        @{ Challenge = 'Basic realm="unterminated' }
+        @{ Challenge = "Basic realm=challenge.key`r`nextra" }
+    ) {
+        { Get-TrustViewArcChallengeSecret -Challenge $Challenge -TokenDirectory $tokenDirectory } | Should -Throw
+    }
+
+    It 'rejects an outside or nested token path <Name> before accessing files' -ForEach @(
+        @{ Name = 'outside'; Relative = '../outside.key' }
+        @{ Name = 'nested'; Relative = 'nested/challenge.key' }
+        @{ Name = 'wrong extension'; Relative = 'challenge.txt' }
+    ) {
+        Mock Get-Item { throw 'Should not access an untrusted file' }
+        $path = Join-Path $tokenDirectory $Relative
+        { Get-TrustViewArcChallengeSecret -Challenge ('Basic realm=' + $path) -TokenDirectory $tokenDirectory } |
+            Should -Throw 'Arc identity returned an invalid token-file path.'
+        Should -Invoke Get-Item -Times 0
+    }
+
+    It 'rejects a missing token file' {
+        Remove-Item -LiteralPath $tokenPath
+        { Get-TrustViewArcChallengeSecret -Challenge ('Basic realm=' + $tokenPath) -TokenDirectory $tokenDirectory } |
+            Should -Throw
+    }
+
+    It 'rejects a reparse-point <Name>' -ForEach @(
+        @{ Name = 'file'; ReparseDirectory = $false }
+        @{ Name = 'directory'; ReparseDirectory = $true }
+    ) {
+        Mock Get-Item {
+            if ($LiteralPath -eq $tokenDirectory) {
+                return @{ PSIsContainer = $true; Attributes = $(if ($ReparseDirectory) { 1024 } else { 16 }) }
+            }
+            return @{ PSIsContainer = $false; Attributes = $(if ($ReparseDirectory) { 0 } else { 1024 }); Length = 20 }
+        }
+        { Get-TrustViewArcChallengeSecret -Challenge ('Basic realm=' + $tokenPath) -TokenDirectory $tokenDirectory } |
+            Should -Throw 'Arc identity returned an invalid token file.'
+    }
+
+    It 'rejects a reparse point in the agent directory before accessing the token file' {
+        Mock Get-Item {
+            @{ PSIsContainer = $true; Attributes = 16; Parent = @{ Attributes = 1024; Parent = $null } }
+        } -ParameterFilter { $LiteralPath -eq $tokenDirectory }
+        { Get-TrustViewArcChallengeSecret -Challenge ('Basic realm=' + $tokenPath) -TokenDirectory $tokenDirectory } |
+            Should -Throw 'Arc identity returned an invalid token file.'
+        Should -Invoke Get-Item -Times 0 -ParameterFilter { $LiteralPath -eq $tokenPath }
+    }
+
+    It 'rejects invalid file contents <Name>' -ForEach @(
+        @{ Name = 'oversized'; Content = ('A' * 4097) }
+        @{ Name = 'empty'; Content = '' }
+        @{ Name = 'embedded newline'; Content = "first`nsecond" }
+    ) {
+        Set-Content -LiteralPath $tokenPath -Value $Content
+        { Get-TrustViewArcChallengeSecret -Challenge ('Basic realm=' + $tokenPath) -TokenDirectory $tokenDirectory } |
+            Should -Throw
+    }
+}
+
 Describe 'Private TrustView processing' {
     BeforeEach {
         $request = [pscustomobject]@{
@@ -399,9 +562,17 @@ Describe 'Consumption workflow contract' {
                 ConvertTo-Json -Depth 20 -Compress)
     }
 
-    It 'pins remote execution to dkmant0-01 and a locally staged worker' {
+    It 'pins remote execution to an operator-configured Arc machine and a locally staged worker' {
         $submit = $template.resources[0].properties.definition.actions.Run_private_TrustView_order.actions.Submit_VM_Run_Command
-        $submit.inputs.uri | Should -Match '/virtualMachines/dkmant0-01/runCommands/'
+        $submit.inputs.uri | Should -Match '/providers/Microsoft.HybridCompute/machines/'
+        $submit.inputs.uri | Should -Match ([regex]::Escape("uriComponent(parameters('ArcMachineName'))"))
+        $submit.inputs.uri | Should -Match '/runCommands/'
+        $submit.inputs.uri | Should -Match 'api-version=2025-01-13'
+        $submit.inputs.uri | Should -Not -Match 'Microsoft.Compute|/extensions/|triggerBody'
+        $submit.inputs.body.location | Should -Be "@parameters('ArcLocation')"
+        $workflow.parameters.ArcMachineName.value | Should -Be 'REPLACE_WITH_EXACT_ARC_MACHINE_NAME'
+        $template.resources[0].properties.parameters.ArcMachineName.value | Should -Be "[parameters('arcMachineName')]"
+        $template.parameters.arcMachineName.PSObject.Properties.Name | Should -Not -Contain 'defaultValue'
         $submit.inputs.body.properties.source.script | Should -Match (
             [regex]::Escape("& 'C:\TrustView\Invoke-TrustViewOrder.ps1' -RequestBase64 `$RequestBase64 *> `$null")
         )
@@ -430,5 +601,9 @@ Describe 'Consumption workflow contract' {
         $actions.Cleanup_remote_artifacts.actions.Delete_VM_result.inputs.method | Should -Be 'DELETE'
         $actions.Cleanup_remote_artifacts.actions.Delete_VM_result.operationOptions | Should -Be 'DisableAsyncPattern'
         $actions.Cleanup_remote_artifacts.actions.Delete_VM_Run_Command.inputs.method | Should -Be 'DELETE'
+        $actions.Cleanup_remote_artifacts.actions.Delete_VM_Run_Command.inputs.uri |
+            Should -Be $actions.Run_private_TrustView_order.actions.Submit_VM_Run_Command.inputs.uri
+        $actions.Cleanup_remote_artifacts.actions.Delete_VM_Run_Command.operationOptions |
+            Should -Not -Be 'DisableAsyncPattern'
     }
 }

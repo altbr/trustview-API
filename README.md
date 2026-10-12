@@ -1,18 +1,18 @@
 # trustview-API
 
-## Private API access through dkmant0-01
+## Private API access through an Azure Arc server
 
 `Trustview_Order_Checkout.json` is the existing Standard Logic App workflow and
 is unchanged. `Trustview_Order_Checkout_RunCommand.json` can be pasted directly
 into a **Consumption** Logic App's **Logic app code view**. The optional ARM
 deployment template is `Trustview_Order_Checkout_RunCommand.arm.json`. Both
 versions accept the same certificate request, but all TrustView calls run on
-**dkmant0-01**, not in the Logic App:
+the configured **Azure Arc-enabled Windows server**, not in the Logic App:
 
 1. The Logic App validates the request and uses its managed identity to create
-   a managed Azure VM Run Command on the fixed VM.
+   an Arc Run Command on the operator-configured machine.
 2. Run Command invokes the locally installed `Invoke-TrustViewOrder.ps1`.
-3. The worker retrieves the API key from Key Vault using the **VM's** identity,
+3. The worker retrieves the API key from Key Vault using the **Arc machine's** identity,
    orders the certificate, waits for an active certificate with a private key,
    finds exactly one contact by email, associates that contact, and checks out
    the certificate for email delivery or download.
@@ -20,31 +20,39 @@ versions accept the same certificate request, but all TrustView calls run on
    managed identity. The Logic App reads it, returns the result, and attempts
    to delete both the blob and the Run Command resource.
 
-TrustView needs only a private HTTPS endpoint reachable from the VM. No inbound
+TrustView needs only a private HTTPS endpoint reachable from the server. No inbound
 TrustView API exposure, Standard Logic App, API key in the workflow, storage
 account key, or SAS token is required. The request endpoint still needs caller
 authentication and network restrictions; Run Command does not replace those.
 
 ### Prerequisites and identities
 
-This version targets an **Azure Windows VM**, not an Azure Arc-enabled server.
-`dkmant0-01` must have a healthy Azure VM Agent and a supported managed Run
-Command OS (for example, Windows Server 2016 or later; Server 2012/R2 is not
-listed as supported).
-The worker runs under the agent's default privileged account with Windows
-PowerShell 5.1 or later. Its path and the target VM cannot be supplied by callers.
-If this server is Linux or Arc-enabled, the command and identity integration
-must be adapted before deployment.
+This version targets an **Azure Arc-enabled Windows server**, not an Azure VM
+or Linux server. Use a healthy, currently supported Connected Machine agent;
+Arc Run Command requires agent **1.33 or later** and is currently documented as
+**preview**. Run Command is built into the agent; do not deploy a separate
+`machines/extensions` resource for it. The workflow uses
+`Microsoft.HybridCompute/machines/<name>/runCommands` with API `2025-01-13`.
+Ensure the `himds` and `ExtensionService` services are healthy. Local Arc
+security controls must permit `Microsoft.Cplat.Core/RunCommandHandlerWindows`;
+disabled extensions, handler blocklists, or monitor mode can prevent execution.
+Do not weaken those controls without your security team's approval.
 
-Enable a system-assigned managed identity on both the VM and the new Logic App.
+The worker runs as **Local System** with Windows PowerShell 5.1 or later. Its
+path and target machine cannot be supplied by certificate callers. No RunAs
+password is required.
+
+Arc onboarding creates the machine's system-assigned managed identity. Enable
+the new Logic App's system-assigned identity separately and use the Arc
+machine's principal ID for server permissions, not an Azure VM principal.
 Provision Key Vault, a storage account, and an existing container before use.
 Grant these permissions:
 
 | Identity | Scope | Permissions |
 | --- | --- | --- |
-| Logic App | Only the `dkmant0-01` VM resource | Custom role with `Microsoft.Compute/virtualMachines/read` and `Microsoft.Compute/virtualMachines/runCommands/read`, `/write`, `/delete` |
-| VM | Only the TrustView API-key secret | Key Vault Secrets User, or an equivalent secret `get` access policy |
-| VM | Only the result container | Custom storage data role with `Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write` |
+| Logic App | Only the configured Arc machine resource | Custom role with `Microsoft.HybridCompute/machines/read` and `Microsoft.HybridCompute/machines/runcommands/read`, `/write`, `/delete` |
+| Arc machine | Only the TrustView API-key secret | Key Vault Secrets User, or an equivalent secret `get` access policy |
+| Arc machine | Only the result container | Custom storage data role with `Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write` |
 | Logic App | Only the result container | Custom storage data role with `Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read` and `/delete` |
 
 The blob permissions above are **DataActions**, not management-plane Actions.
@@ -53,13 +61,21 @@ scope; role **assignments** should use the narrower scopes in the table.
 Storage Blob Data Contributor at container scope works for initial deployment,
 but grants more access than these custom roles.
 
-Run Command write permission allows arbitrary privileged execution on that VM,
+Run Command write permission allows arbitrary privileged execution on that server,
 even though this workflow submits only a fixed worker invocation. Protect the
-Logic App identity, workflow editing permissions, and VM administrators
-accordingly. Do not assign subscription-wide VM Contributor or Owner.
+Logic App identity, workflow editing permissions, and server administrators
+accordingly. Do not assign subscription-wide Contributor or Owner.
 
-Allow the VM outbound access to Azure VM Agent/Run Command services, IMDS
-(`169.254.169.254`), Key Vault, result storage, and the private TrustView endpoint.
+Allow the server outbound access to the required Arc services, Key Vault,
+result storage, and the private TrustView endpoint. Arc identity uses local
+HIMDS at **`http://localhost:40342`**, not Azure VM IMDS (`169.254.169.254`).
+The agent installs the machine-level `IDENTITY_ENDPOINT` setting; the worker
+requires `http://localhost:40342/metadata/identity/oauth2/token` and authenticates
+through its token-file challenge. Do not set this to a remote endpoint.
+Manual token callers need an elevated local Administrators session or membership
+in **Hybrid Agent Extension Applications**. Do not relax the ACL on
+`%ProgramData%\AzureConnectedMachineAgent\Tokens` or expose the local identity port
+externally. The worker bypasses proxies and rejects redirects for HIMDS.
 Use trusted HTTPS certificates; the worker does not disable certificate
 validation or follow HTTP redirects.
 
@@ -70,7 +86,7 @@ outbound VNet integration. Configure a supported storage firewall exception or
 allow the documented regional Consumption outbound IP addresses, while
 retaining managed-identity authorization. A storage account accessible only
 through a private endpoint is incompatible with this workflow as written.
-TrustView and Key Vault can remain VM-private regardless.
+TrustView and Key Vault can remain server-private regardless.
 
 Disable anonymous blob access and require TLS 1.2 or later. Use a dedicated
 result container with no unrelated readers. Download results temporarily
@@ -83,7 +99,7 @@ asynchronous responses and run-history access as sensitive data too.
 
 ### Install the worker
 
-On `dkmant0-01`, install the checked-in worker as:
+On the target Arc server, install the checked-in worker as:
 
 ```text
 C:\TrustView\Invoke-TrustViewOrder.ps1
@@ -94,7 +110,7 @@ administrators. Follow your organization's PowerShell signing/execution policy;
 the workflow does not bypass it. Do not accept a script URL or script contents
 from certificate callers.
 
-Set these **machine-level** environment variables on the VM:
+Set these **machine-level** environment variables on the server:
 
 | Setting | Value |
 | --- | --- |
@@ -112,12 +128,12 @@ these settings. Both workflow versions and the worker target the Azure public cl
 
 ### Test the PowerShell worker manually
 
-Run this test **on `dkmant0-01`**, in an administrator Windows PowerShell 5.1
+Run this test **on the target Arc server**, in an elevated administrator Windows PowerShell 5.1
 or later session, after installing the worker, setting all six machine-level
-environment variables above, and granting the **VM identity** its Key Vault
+environment variables above, and granting the **Arc machine identity** its Key Vault
 secret-read and result-container write permissions. You do not need to trigger
-the Logic App or sign in to Azure PowerShell: the worker uses the VM's managed
-identity through IMDS. Running it on your workstation will not use that identity.
+the Logic App or sign in to Azure PowerShell: the worker uses the server's managed
+identity through local HIMDS. Running it on your workstation will not use that identity.
 
 Keep the Logic App disabled during this test. **This is a real certificate order,
 not a dry run**, and email delivery sends real emails. Use a test ADCS template,
@@ -137,7 +153,7 @@ $request = @{
     deliveryMethod = 'email'
     keyspec = 'RSA:2048'
     ip_sans = @()
-    comment = 'Manual VM worker test'
+    comment = 'Manual Arc worker test'
     correlationId = $correlationId
 }
 $requestJson = $request | ConvertTo-Json -Depth 10 -Compress
@@ -174,7 +190,7 @@ user authentication** and your own authorized operator account. That account
 needs blob read/delete permissions on the result container (for example,
 Storage Blob Data Contributor at container scope), portal resource visibility,
 and a permitted storage network path. Do not add blob-read permissions to the
-write-only VM identity just to inspect this test.
+write-only Arc machine identity just to inspect this test.
 
 Locate the exact blob named by `$blobName` and inspect it in a secure viewer:
 
@@ -187,7 +203,7 @@ Locate the exact blob named by `$blobName` and inspect it in a secure viewer:
   out, and `502` means processing/API failure. Check `body.error`,
   `body.message`, and any `body.certificateId`; inspect TrustView before retrying.
 - A thrown error with no result blob points to request/configuration validation
-  or result-publication failure. Check the six machine settings, VM identity,
+  or result-publication failure. Check the six machine settings, Arc identity,
   Key Vault/storage RBAC, and network/TLS connectivity; do not print tokens or
   the API key while troubleshooting.
 
@@ -222,8 +238,8 @@ stages, with a numeric HTTP status when available:
 | `configuration_validation` | Machine-level settings, exact URL/OID/name formats above, and unmodified environment-variable names in the worker |
 | `request_validation` | Rebuild the UTF-8 base64 request; ensure the required unique `correlationId` is present and pass the encoded string, not a JSON object |
 | `order_processing` | An unexpected worker execution failure; inspect TrustView before retrying |
-| `storage_identity` | VM system-assigned identity and IMDS access; an Azure sign-in under your user does not supply the worker's token |
-| `result_upload` | Existing result container, VM blob-write DataAction, storage firewall/network access, DNS, and TLS; HTTP 403 can indicate authorization or a network restriction, while HTTP 404 can indicate a missing container |
+| `storage_identity` | Connected Machine agent/HIMDS health, machine-level `IDENTITY_ENDPOINT`, and local token-file permissions; an Azure sign-in under your user does not supply the worker's token |
+| `result_upload` | Existing result container, Arc machine blob-write DataAction, storage firewall/network access, DNS, and TLS; HTTP 403 can indicate authorization or a network restriction, while HTTP 404 can indicate a missing container |
 
 The last two stages happen **after** order processing; an order or email
 delivery may already exist even when publication fails. Do not retry the
@@ -231,6 +247,33 @@ normal worker just to obtain a diagnostic. First inspect TrustView and any
 existing result, then share only the sanitized stage/status message when
 requesting help. Never share raw exception dumps, access tokens, API keys,
 passwords, PFX contents, or `$requestBase64` (base64 is not encryption).
+
+#### Check Arc identity without placing an order
+
+After replacing the installed worker with this Arc version, run the following
+on the Arc server in an elevated administrator session. It requests tokens for
+Key Vault and Storage but does **not** read secrets, write blobs, call TrustView,
+or place orders. It prints no tokens or challenge-file contents:
+
+```powershell
+& {
+    $ErrorActionPreference = 'Stop'
+    . 'C:\TrustView\Invoke-TrustViewOrder.ps1' -RequestBase64 'unused-when-dot-sourced'
+    try {
+        $null = Get-TrustViewManagedIdentityToken -Resource 'https://vault.azure.net'
+        $null = Get-TrustViewManagedIdentityToken -Resource 'https://storage.azure.com/'
+        Write-Output 'Arc identity token checks passed for Key Vault and Storage.'
+    }
+    catch { Write-Output 'Arc identity token check failed; check agent health, IDENTITY_ENDPOINT, and local token-file permissions.' }
+}
+```
+
+Successful token acquisition does **not** validate Key Vault/storage RBAC or
+network access to those services. Keep normal processing paused until those
+permissions are confirmed and earlier TrustView orders have been inspected.
+Arc's built-in Run Command Blob output does not support managed-identity
+authentication; this workflow instead keeps the worker's direct authenticated
+Blob PUT. Never use command output to transfer the PFX or its password.
 
 For a separate download test, set `deliveryMethod = 'download'` in the request
 and rerun the preparation block to generate a **new** correlation ID and encoded
@@ -243,7 +286,7 @@ paste it into a PR, or store it in an unprotected download location.
 the Logic App will not clean up this direct invocation. Securely remove any
 local copies and account for the storage retention caveats above. No Run
 Command resource is created by this local test. Passing it validates the worker
-and VM dependencies, not Logic App permissions, Run Command's SYSTEM execution
+and server dependencies, not Logic App permissions, Run Command's SYSTEM execution
 context, or the asynchronous client path; test those separately afterward.
 
 ### Publish through Logic App Code View
@@ -252,7 +295,7 @@ context, or the asynchronous client path; test those separately afterward.
    until the worker, identity permissions, networking, and caller restrictions
    are configured.
 2. Under **Identity**, enable the **System assigned** identity and save. Assign
-   the Logic App and VM permissions from the table above.
+   the Logic App and Arc machine permissions from the table above.
 3. Under **Workflow settings**, configure the trigger's allowed inbound IP
    addresses to include only approved caller ranges. Do not allow `0.0.0.0/0`.
    Code View does **not** configure this resource-level access control or the
@@ -261,18 +304,19 @@ context, or the asynchronous client path; test those separately afterward.
    `Trustview_Order_Checkout_RunCommand.json` file.
 5. Replace the placeholder strings in the **top-level `parameters`** section
    using the values below, then **Save**.
-6. Confirm the VM worker and all prerequisites are ready before enabling the
+6. Confirm the server worker and all prerequisites are ready before enabling the
    Logic App and sending a test request.
 
 | Runtime parameter | Value to supply |
 | --- | --- |
-| `VmSubscriptionId` | Subscription ID containing `dkmant0-01` |
-| `VmResourceGroup` | Resource group containing `dkmant0-01` |
-| `VmLocation` | VM's region, such as `westeurope`, not necessarily the Logic App region |
+| `ArcSubscriptionId` | Subscription ID containing the Arc machine resource |
+| `ArcResourceGroup` | Resource group containing the Arc machine resource |
+| `ArcMachineName` | Exact Arc **machine resource name** from Azure Portal; confirm `dkmant0-01` (zero) versus `dkmanto-01` (letter o) |
+| `ArcLocation` | Arc resource's Azure region, such as `westeurope`, not necessarily the Logic App region or the server's physical location |
 | `ResultsBlobServiceUri` | `https://<storage-account>.blob.core.windows.net` without a trailing slash |
 | `ResultsContainerName` | Existing result container; defaults to `trustview-results` |
 
-The result store must match the VM's machine-level settings. The JSON contains
+The result store must match the server's machine-level settings. The JSON contains
 only `definition` and runtime `parameters` with **`value`** entries. Keep the
 parameter type declarations inside `definition.parameters`. Do not paste ARM
 fields such as `resources`, `workflowName`, or deployment parameter
@@ -280,22 +324,30 @@ fields such as `resources`, `workflowName`, or deployment parameter
 save error. Code View does not create resources, install the worker, or assign
 permissions.
 
+If you published the earlier Azure VM version, replace both the installed worker
+and the entire Code View JSON. Retain the six server configuration settings and
+storage values, but replace `VmSubscriptionId`, `VmResourceGroup`, and `VmLocation`
+with the `Arc...` bindings above and supply `ArcMachineName`. Copy the values from
+the parent `Microsoft.HybridCompute/machines/<name>` resource, **not** its
+`/extensions/<name>` child. Assign the new HybridCompute permissions to the
+Logic App; Compute VM permissions do not authorize Arc Run Command.
+
 ### Optional ARM deployment
 
 Deploy `Trustview_Order_Checkout_RunCommand.arm.json` as an ARM resource-group
 deployment, supplying:
 
-- `vmResourceGroup`: resource group containing `dkmant0-01`.
-- `vmLocation`: that VM's Azure region, not necessarily the Logic App region.
-- `resultsStorageAccountName` and `resultsContainerName`: the VM's result store.
+- `arcResourceGroup` and `arcMachineName`: exact target Arc resource group/name.
+- `arcLocation`: that Arc resource's Azure region, not necessarily the Logic App region.
+- `resultsStorageAccountName` and `resultsContainerName`: the server's result store.
 - `allowedCallerIpRanges`: a nonempty array of objects such as
   `[{"addressRange":"198.51.100.10/32"}]`, replaced with actual approved caller IPs.
   Do not use an unrestricted range.
-- Optionally `workflowName`, `location`, and `vmSubscriptionId` (defaults to the
+- Optionally `workflowName`, `location`, and `arcSubscriptionId` (defaults to the
   deployment subscription).
 
 The template creates only the workflow and its identity. It does **not** create
-the VM, Key Vault, container, role definitions/assignments, or install the
+the Arc machine, Key Vault, container, role definitions/assignments, or install the
 worker. After deployment, assign the identity permissions above and allow time
 for RBAC propagation before sending requests.
 
@@ -361,7 +413,9 @@ The worker publishes its terminal result once, without upload retries; the
 workflow requires HTTP 200 and a matching correlation ID before using it.
 `asyncExecution` acknowledges worker startup, not successful checkout. Managed
 Run Command deletion can terminate a still-running worker, so cleanup runs only
-after result retrieval or workflow failure/timeout.
+after result retrieval or workflow failure/timeout and allows Azure's asynchronous
+deletion polling before deleting the result blob. Monitor failed or cancelled
+cleanup; deletion does not undo a certificate order.
 
 ### Validation
 
@@ -376,14 +430,17 @@ Tests mock network calls; they cover request validation, injection-safe data
 handling, readiness limits, contact matching, email/download behavior, error
 redaction, large PFX transport, and the workflow contract. They do not replace
 an Azure deployment test. They also check the Code View envelope, literal
-runtime parameters, and parity with the ARM workflow definition. Save the
+runtime parameters, Arc challenge authentication/path validation, and parity
+with the ARM workflow definition. Save the
 Code View version or validate the optional ARM deployment in your subscription,
 then exercise email and download requests against a test ADCS template,
 including missing contacts, delayed issuance, denied permissions, and cleanup.
 
 Azure references:
 
-- [Managed Run Command on Windows VMs](https://learn.microsoft.com/en-us/azure/virtual-machines/windows/run-command-managed)
+- [Run Command on Azure Arc-enabled servers](https://learn.microsoft.com/en-us/azure/azure-arc/servers/run-command)
+- [Azure Arc managed-identity authentication](https://learn.microsoft.com/en-us/azure/azure-arc/servers/managed-identity-authentication)
+- [HybridCompute RBAC operations](https://learn.microsoft.com/en-us/azure/role-based-access-control/permissions/hybrid-multicloud#microsofthybridcompute)
 - [Consumption Request/Response and asynchronous replies](https://learn.microsoft.com/en-us/azure/connectors/connectors-native-reqres)
 - [Logic Apps managed-identity authentication](https://learn.microsoft.com/en-us/azure/logic-apps/authenticate-with-managed-identity)
 - [Secure Logic Apps inputs and outputs](https://learn.microsoft.com/en-us/azure/logic-apps/set-up-security-permissions#secure-run-history)

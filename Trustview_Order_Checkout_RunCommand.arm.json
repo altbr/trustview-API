@@ -10,14 +10,21 @@
             "type": "string",
             "defaultValue": "[resourceGroup().location]"
         },
-        "vmSubscriptionId": {
+        "arcSubscriptionId": {
             "type": "string",
             "defaultValue": "[subscription().subscriptionId]"
         },
-        "vmResourceGroup": {
+        "arcResourceGroup": {
             "type": "string"
         },
-        "vmLocation": {
+        "arcMachineName": {
+            "type": "string",
+            "minLength": 1,
+            "metadata": {
+                "description": "Exact Azure Arc machine resource name. Confirm dkmant0-01 (zero) versus dkmanto-01 (letter o)."
+            }
+        },
+        "arcLocation": {
             "type": "string"
         },
         "resultsStorageAccountName": {
@@ -54,14 +61,17 @@
                     }
                 },
                 "parameters": {
-                    "VmSubscriptionId": {
-                        "value": "[parameters('vmSubscriptionId')]"
+                    "ArcSubscriptionId": {
+                        "value": "[parameters('arcSubscriptionId')]"
                     },
-                    "VmResourceGroup": {
-                        "value": "[parameters('vmResourceGroup')]"
+                    "ArcResourceGroup": {
+                        "value": "[parameters('arcResourceGroup')]"
                     },
-                    "VmLocation": {
-                        "value": "[parameters('vmLocation')]"
+                    "ArcMachineName": {
+                        "value": "[parameters('arcMachineName')]"
+                    },
+                    "ArcLocation": {
+                        "value": "[parameters('arcLocation')]"
                     },
                     "ResultsBlobServiceUri": {
                         "value": "[format('https://{0}.blob.core.windows.net', parameters('resultsStorageAccountName'))]"
@@ -74,9 +84,10 @@
                     "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
                     "contentVersion": "1.0.0.0",
                     "parameters": {
-                        "VmSubscriptionId": { "type": "String" },
-                        "VmResourceGroup": { "type": "String" },
-                        "VmLocation": { "type": "String" },
+                        "ArcSubscriptionId": { "type": "String" },
+                        "ArcResourceGroup": { "type": "String" },
+                        "ArcMachineName": { "type": "String" },
+                        "ArcLocation": { "type": "String" },
                         "ResultsBlobServiceUri": { "type": "String" },
                         "ResultsContainerName": { "type": "String" }
                     },
@@ -184,7 +195,7 @@
                                     "type": "Http",
                                     "operationOptions": "DisableAsyncPattern",
                                     "inputs": {
-                                        "uri": "@concat('https://management.azure.com/subscriptions/', parameters('VmSubscriptionId'), '/resourceGroups/', parameters('VmResourceGroup'), '/providers/Microsoft.Compute/virtualMachines/dkmant0-01/runCommands/', workflow().run.name, '?api-version=2024-11-01')",
+                                        "uri": "@concat('https://management.azure.com/subscriptions/', parameters('ArcSubscriptionId'), '/resourceGroups/', parameters('ArcResourceGroup'), '/providers/Microsoft.HybridCompute/machines/', uriComponent(parameters('ArcMachineName')), '/runCommands/', workflow().run.name, '?api-version=2025-01-13')",
                                         "method": "PUT",
                                         "authentication": {
                                             "type": "ManagedServiceIdentity",
@@ -192,10 +203,10 @@
                                         },
                                         "headers": { "Content-Type": "application/json" },
                                         "body": {
-                                            "location": "@parameters('VmLocation')",
+                                            "location": "@parameters('ArcLocation')",
                                             "properties": {
                                                 "source": {
-                                                    "script": "param([string]$RequestBase64)\n$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\ntry {\n    & 'C:\\TrustView\\Invoke-TrustViewOrder.ps1' -RequestBase64 $RequestBase64 *> $null\n    Write-Output 'TrustView worker finished.'\n} catch {\n    throw 'TrustView worker failed; check VM configuration and permissions.'\n}"
+                                                    "script": "param([string]$RequestBase64)\n$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\ntry {\n    & 'C:\\TrustView\\Invoke-TrustViewOrder.ps1' -RequestBase64 $RequestBase64 *> $null\n    Write-Output 'TrustView worker finished.'\n} catch {\n    throw 'TrustView worker failed; check Arc server configuration and permissions.'\n}"
                                                 },
                                                 "parameters": [
                                                     {
@@ -294,9 +305,8 @@
                             "actions": {
                                 "Delete_VM_Run_Command": {
                                     "type": "Http",
-                                    "operationOptions": "DisableAsyncPattern",
                                     "inputs": {
-                                        "uri": "@concat('https://management.azure.com/subscriptions/', parameters('VmSubscriptionId'), '/resourceGroups/', parameters('VmResourceGroup'), '/providers/Microsoft.Compute/virtualMachines/dkmant0-01/runCommands/', workflow().run.name, '?api-version=2024-11-01')",
+                                        "uri": "@concat('https://management.azure.com/subscriptions/', parameters('ArcSubscriptionId'), '/resourceGroups/', parameters('ArcResourceGroup'), '/providers/Microsoft.HybridCompute/machines/', uriComponent(parameters('ArcMachineName')), '/runCommands/', workflow().run.name, '?api-version=2025-01-13')",
                                         "method": "DELETE",
                                         "authentication": {
                                             "type": "ManagedServiceIdentity",
@@ -371,7 +381,7 @@
                                 },
                                 "body": {
                                     "error": "remote_certificate_workflow_failed",
-                                    "message": "VM execution or result retrieval failed. Check TrustView before retrying because an order might have been created.",
+                                    "message": "Arc execution or result retrieval failed. Check TrustView before retrying because an order might have been created.",
                                     "correlationId": "@workflow().run.name"
                                 }
                             },

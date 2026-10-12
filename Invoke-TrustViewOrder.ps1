@@ -17,7 +17,7 @@ function Get-TrustViewConfiguration {
     }
     foreach ($value in $configuration.Values) {
         if ([string]::IsNullOrWhiteSpace($value)) {
-            throw 'A required VM configuration setting is missing.'
+            throw 'A required server configuration setting is missing.'
         }
     }
 
@@ -32,7 +32,7 @@ function Get-TrustViewConfiguration {
         $configuration.TemplateOid -notmatch '^[0-9]+(\.[0-9]+)+$' -or
         $configuration.BlobServiceUri -cnotmatch '^https://[a-z0-9]{3,24}\.blob\.core\.windows\.net$' -or
         $configuration.ContainerName -cnotmatch '^[a-z0-9](?:[a-z0-9]|-(?!-)){1,61}[a-z0-9]$') {
-        throw 'A VM configuration setting is invalid.'
+        throw 'A server configuration setting is invalid.'
     }
     return $configuration
 }
@@ -85,31 +85,111 @@ function ConvertFrom-TrustViewRequest {
     return $request
 }
 
-function Get-TrustViewManagedIdentityToken {
-    param([string]$Resource)
+function Invoke-TrustViewIdentityRequest {
+    param([string]$Uri, [string]$Authorization)
 
-    $uri = 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=' +
-        [uri]::EscapeDataString($Resource)
-    # IMDS must bypass proxies, including on Windows PowerShell 5.1.
-    $metadataRequest = [Net.HttpWebRequest]::Create($uri)
+    # Local HIMDS must bypass proxies, including on Windows PowerShell 5.1.
+    $metadataRequest = [Net.HttpWebRequest]::Create($Uri)
     $metadataRequest.Proxy = $null
     $metadataRequest.AllowAutoRedirect = $false
     $metadataRequest.Timeout = 30000
     $metadataRequest.ReadWriteTimeout = 30000
     $metadataRequest.Headers.Add('Metadata', 'true')
-    $response = $metadataRequest.GetResponse()
+    if ($Authorization) { $metadataRequest.Headers.Add('Authorization', $Authorization) }
+    $response = $null
     try {
-        $reader = New-Object IO.StreamReader($response.GetResponseStream())
         try {
-            $token = ($reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop).access_token
+            $response = $metadataRequest.GetResponse()
         }
-        finally { $reader.Dispose() }
+        catch [Net.WebException] {
+            if ($null -eq $_.Exception.Response) { throw }
+            $response = $_.Exception.Response
+        }
+        $token = $null
+        if ([int]$response.StatusCode -eq 200) {
+            $reader = New-Object IO.StreamReader($response.GetResponseStream())
+            try { $token = ($reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop).access_token }
+            finally { $reader.Dispose() }
+        }
+        return @{
+            StatusCode = [int]$response.StatusCode
+            Challenge = $response.Headers['WWW-Authenticate']
+            Token = $token
+        }
     }
-    finally { $response.Dispose() }
-    if ([string]::IsNullOrWhiteSpace($token)) {
-        throw 'Managed identity did not return an access token.'
+    finally { if ($null -ne $response) { $response.Dispose() } }
+}
+
+function Get-TrustViewArcChallengeSecret {
+    param(
+        [string]$Challenge,
+        [string]$TokenDirectory = (Join-Path ([Environment]::GetFolderPath(
+            [Environment+SpecialFolder]::CommonApplicationData)) 'AzureConnectedMachineAgent/Tokens')
+    )
+
+    if ($Challenge -cnotmatch '^Basic realm=(?:"([^"\r\n]+)"|([^"\r\n]+))$') {
+        throw 'Arc identity returned an invalid authentication challenge.'
     }
-    return $token
+    $path = $Matches[1]
+    if (-not $path) { $path = $Matches[2] }
+    if (-not [IO.Path]::IsPathRooted($path)) {
+        throw 'Arc identity returned an invalid token-file path.'
+    }
+    $path = [IO.Path]::GetFullPath($path)
+    $directory = [IO.Path]::GetFullPath($TokenDirectory).TrimEnd('\', '/')
+    if ([IO.Path]::GetDirectoryName($path) -ine $directory -or
+        [IO.Path]::GetExtension($path) -ine '.key') {
+        throw 'Arc identity returned an invalid token-file path.'
+    }
+    $folder = Get-Item -LiteralPath $directory -Force -ErrorAction Stop
+    for ($ancestor = $folder; $null -ne $ancestor; $ancestor = $ancestor.Parent) {
+        if ($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw 'Arc identity returned an invalid token file.'
+        }
+    }
+    $file = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    if (-not $folder.PSIsContainer -or $file.PSIsContainer -or
+        ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        $file.Length -gt 4096) {
+        throw 'Arc identity returned an invalid token file.'
+    }
+    $secret = [IO.File]::ReadAllText($path).Trim()
+    if ([string]::IsNullOrWhiteSpace($secret) -or $secret.Length -gt 4096 -or $secret -match '[\r\n]') {
+        throw 'Arc identity returned an invalid challenge secret.'
+    }
+    return $secret
+}
+
+function Get-TrustViewManagedIdentityToken {
+    param(
+        [string]$Resource,
+        [string]$IdentityEndpoint = ([Environment]::GetEnvironmentVariable('IDENTITY_ENDPOINT', 'Machine'))
+    )
+
+    try {
+        if ($IdentityEndpoint -cne 'http://localhost:40342/metadata/identity/oauth2/token') {
+            throw 'The Arc identity endpoint is missing or invalid.'
+        }
+        $uri = $IdentityEndpoint + '?api-version=2020-06-01&resource=' + [uri]::EscapeDataString($Resource)
+        $response = Invoke-TrustViewIdentityRequest -Uri $uri
+        if ($response.StatusCode -ne 401) {
+            throw 'Arc identity did not return an authentication challenge.'
+        }
+        $secret = Get-TrustViewArcChallengeSecret -Challenge $response.Challenge
+        $response = Invoke-TrustViewIdentityRequest -Uri $uri -Authorization ('Basic ' + $secret)
+        if ($response.StatusCode -ne 200 -or $response.Token -isnot [string] -or
+            [string]::IsNullOrWhiteSpace($response.Token)) {
+            throw 'Arc identity did not return an access token.'
+        }
+        return $response.Token
+    }
+    catch {
+        throw 'Arc managed identity token acquisition failed. Check the Connected Machine agent, IDENTITY_ENDPOINT, and local token-file permissions.'
+    }
+    finally {
+        $secret = $null
+        $response = $null
+    }
 }
 
 function Invoke-TrustViewHttp {
@@ -244,13 +324,13 @@ function Invoke-TrustViewOrder {
             method = 'download'
             format = 'pfx'
             password = $password
-            comment = 'Certificate and private-key checkout through Azure VM Run Command'
+            comment = 'Certificate and private-key checkout through Azure Arc Run Command'
             exportprivatekey = $true
             locale = 'en_US'
         }
         if ($Request.deliveryMethod -ceq 'email') {
             $checkoutBody.method = 'mail-mail'
-            $checkoutBody.comment = 'Certificate and password delivery through Azure VM Run Command'
+            $checkoutBody.comment = 'Certificate and password delivery through Azure Arc Run Command'
             $checkoutBody.locale = $locale
             $checkoutBody.passwordrecipient = $contact.emailAddress
             $checkoutBody.checkoutinfo = $contact.emailAddress
@@ -307,7 +387,7 @@ function Invoke-TrustViewOrder {
     catch {
         # Never copy upstream errors into Run Command output or the caller's response.
         return ConvertTo-TrustViewFailure -StatusCode 502 -Code 'certificate_workflow_failed' `
-            -Message 'The VM worker failed. Check TrustView before retrying because an order might have been created.' `
+            -Message 'The Arc worker failed. Check TrustView before retrying because an order might have been created.' `
             -CorrelationId $Request.correlationId -CertificateId $certificateId
     }
 }
