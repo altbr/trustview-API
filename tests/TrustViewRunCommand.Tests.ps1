@@ -236,6 +236,119 @@ Describe 'Secure result transport' {
             ([Text.Encoding]::UTF8.GetString($Body) | ConvertFrom-Json).comment -eq "Quotation: '; Unicode: ø"
         }
     }
+
+    It 'uses an already obtained storage token without requesting another one' {
+        Mock Get-TrustViewManagedIdentityToken { throw 'Unexpected second token request' }
+        Mock Invoke-WebRequest {}
+        Send-TrustViewResult -Result @{ statusCode = 502; body = @{} } `
+            -CorrelationId 'test-run-123' -Configuration $configuration -Token 'test-only-storage-token'
+        Should -Invoke Get-TrustViewManagedIdentityToken -Times 0
+        Should -Invoke Invoke-WebRequest -Times 1 -Exactly -ParameterFilter {
+            $Headers.Authorization -eq ('Bearer ' + 'test-only-storage-token')
+        }
+    }
+}
+
+Describe 'Worker diagnostics' {
+    BeforeEach {
+        $script:workerConfiguration = $configuration.Clone()
+        $script:workerResult = @{
+            statusCode = 200
+            body = @{ correlationId = 'test-run-123'; pfxPassword = 'test-only-sensitive-result' }
+        }
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((@{
+            domains = @('example.internal')
+            contactEmail = 'owner@example.internal'
+            deliveryMethod = 'email'
+            correlationId = 'test-run-123'
+        } | ConvertTo-Json)))
+        Mock Get-TrustViewConfiguration { $script:workerConfiguration }
+        Mock Invoke-TrustViewOrder { $script:workerResult }
+        Mock Get-TrustViewManagedIdentityToken { 'test-only-storage-token' }
+        Mock Send-TrustViewResult {}
+        Mock Invoke-WebRequest { throw 'Unexpected network call during validation' }
+    }
+
+    It 'validates configuration and request without any network calls or orders' {
+        $output = @(Invoke-TrustViewWorker -EncodedRequest $encoded -ValidateOnly)
+        $output.Count | Should -Be 1
+        $output[0] | Should -Be 'Configuration and request validation passed; no network calls or orders were made.'
+        Should -Invoke Get-TrustViewConfiguration -Times 1 -Exactly
+        Should -Invoke Invoke-TrustViewOrder -Times 0
+        Should -Invoke Get-TrustViewManagedIdentityToken -Times 0
+        Should -Invoke Send-TrustViewResult -Times 0
+        Should -Invoke Invoke-WebRequest -Times 0
+    }
+
+    It 'identifies invalid request data without attempting an order' {
+        { Invoke-TrustViewWorker -EncodedRequest '!invalid-base64!' -ValidateOnly } |
+            Should -Throw '*request_validation*'
+        Should -Invoke Invoke-TrustViewOrder -Times 0
+        Should -Invoke Get-TrustViewManagedIdentityToken -Times 0
+        Should -Invoke Send-TrustViewResult -Times 0
+    }
+
+    It 'reports <Stage> without returning raw upstream diagnostics' -ForEach @(
+        @{ Function = 'Get-TrustViewConfiguration'; Stage = 'configuration_validation' }
+        @{ Function = 'Invoke-TrustViewOrder'; Stage = 'order_processing' }
+        @{ Function = 'Get-TrustViewManagedIdentityToken'; Stage = 'storage_identity' }
+        @{ Function = 'Send-TrustViewResult'; Stage = 'result_upload' }
+    ) {
+        Mock -CommandName $Function { throw 'upstream-sensitive-token-and-password' }
+        $failure = $null
+        try { Invoke-TrustViewWorker -EncodedRequest $encoded }
+        catch { $failure = $_ }
+        $failure | Should -Not -BeNullOrEmpty
+        $failure.Exception.Message | Should -Match ([regex]::Escape("during $Stage."))
+        ($failure | Out-String) | Should -Not -Match 'upstream-sensitive|test-only-storage-token|test-only-sensitive-result'
+    }
+
+    It 'preserves only a numeric HTTP status from <Wrapped> upload exceptions' -ForEach @(
+        @{ Wrapped = $false }
+        @{ Wrapped = $true }
+    ) {
+        Mock Send-TrustViewResult {
+            $errorObject = New-Object System.Exception('upstream-sensitive-error-body')
+            $errorObject | Add-Member NoteProperty Response ([pscustomobject]@{
+                StatusCode = [Net.HttpStatusCode]::Forbidden
+            })
+            if ($Wrapped) {
+                throw (New-Object System.Exception('upstream-sensitive-wrapper', $errorObject))
+            }
+            throw $errorObject
+        }
+        { Invoke-TrustViewWorker -EncodedRequest $encoded } | Should -Throw '*result_upload (HTTP 403)*'
+    }
+
+    It 'does not echo unrecognized response status data' {
+        Mock Send-TrustViewResult {
+            $errorObject = New-Object System.Exception('upstream-sensitive-error-body')
+            $errorObject | Add-Member NoteProperty Response ([pscustomobject]@{
+                StatusCode = 'upstream-sensitive-non-numeric-status'
+            })
+            throw $errorObject
+        }
+        $failure = $null
+        try { Invoke-TrustViewWorker -EncodedRequest $encoded }
+        catch { $failure = $_ }
+        $failure.Exception.Message | Should -Match 'during result_upload\.'
+        $failure.Exception.Message | Should -Not -Match 'HTTP'
+        ($failure | Out-String) | Should -Not -Match 'upstream-sensitive'
+    }
+
+    It 'still publishes the order result once and emits only the completion message' {
+        $output = @(Invoke-TrustViewWorker -EncodedRequest $encoded)
+        $output.Count | Should -Be 1
+        $output[0] | Should -Be 'TrustView processing finished; the result was stored for the workflow.'
+        Should -Invoke Invoke-TrustViewOrder -Times 1 -Exactly
+        Should -Invoke Get-TrustViewManagedIdentityToken -Times 1 -Exactly -ParameterFilter {
+            $Resource -eq 'https://storage.azure.com/'
+        }
+        Should -Invoke Send-TrustViewResult -Times 1 -Exactly -ParameterFilter {
+            $Token -eq 'test-only-storage-token' -and $Result -eq $script:workerResult -and
+            $CorrelationId -eq 'test-run-123'
+        }
+    }
 }
 
 Describe 'Consumption workflow contract' {

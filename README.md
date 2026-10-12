@@ -191,6 +191,47 @@ Locate the exact blob named by `$blobName` and inspect it in a secure viewer:
   Key Vault/storage RBAC, and network/TLS connectivity; do not print tokens or
   the API key while troubleshooting.
 
+#### Diagnose a worker exception without another order
+
+If all six presence checks are `True` but the worker still throws, presence
+does not prove that the values or request payload are valid. Replace the
+installed worker with the latest checked-in version; keep
+`Get-TrustViewConfiguration` unchanged, with environment **names**, not URLs or
+other setting values, passed to `GetEnvironmentVariable`.
+
+Run this safe check using your prepared request in the same session:
+
+```powershell
+& 'C:\TrustView\Invoke-TrustViewOrder.ps1' -RequestBase64 $requestBase64 -ValidateOnly
+```
+
+It validates machine configuration and decodes/validates the request, but makes
+**no network calls, uploads, or certificate orders**. Successful output is:
+
+```text
+Configuration and request validation passed; no network calls or orders were made.
+```
+
+This is not a connectivity, identity, Key Vault permission, or storage-write
+test. A validation failure now reports a fixed stage name instead of the old
+catch-all publication message. Normal worker execution also reports these
+stages, with a numeric HTTP status when available:
+
+| Stage | What to check |
+| --- | --- |
+| `configuration_validation` | Machine-level settings, exact URL/OID/name formats above, and unmodified environment-variable names in the worker |
+| `request_validation` | Rebuild the UTF-8 base64 request; ensure the required unique `correlationId` is present and pass the encoded string, not a JSON object |
+| `order_processing` | An unexpected worker execution failure; inspect TrustView before retrying |
+| `storage_identity` | VM system-assigned identity and IMDS access; an Azure sign-in under your user does not supply the worker's token |
+| `result_upload` | Existing result container, VM blob-write DataAction, storage firewall/network access, DNS, and TLS; HTTP 403 can indicate authorization or a network restriction, while HTTP 404 can indicate a missing container |
+
+The last two stages happen **after** order processing; an order or email
+delivery may already exist even when publication fails. Do not retry the
+normal worker just to obtain a diagnostic. First inspect TrustView and any
+existing result, then share only the sanitized stage/status message when
+requesting help. Never share raw exception dumps, access tokens, API keys,
+passwords, PFX contents, or `$requestBase64` (base64 is not encryption).
+
 For a separate download test, set `deliveryMethod = 'download'` in the request
 and rerun the preparation block to generate a **new** correlation ID and encoded
 payload before invoking the worker. A successful result has

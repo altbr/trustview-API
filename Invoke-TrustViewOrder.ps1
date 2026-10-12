@@ -2,7 +2,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [string]$RequestBase64
+    [string]$RequestBase64,
+    [switch]$ValidateOnly
 )
 
 function Get-TrustViewConfiguration {
@@ -312,12 +313,14 @@ function Invoke-TrustViewOrder {
 }
 
 function Send-TrustViewResult {
-    param($Result, [string]$CorrelationId, [hashtable]$Configuration)
+    param($Result, [string]$CorrelationId, [hashtable]$Configuration, [string]$Token)
 
-    $token = Get-TrustViewManagedIdentityToken -Resource 'https://storage.azure.com/'
+    if ([string]::IsNullOrWhiteSpace($Token)) {
+        $Token = Get-TrustViewManagedIdentityToken -Resource 'https://storage.azure.com/'
+    }
     $uri = $Configuration.BlobServiceUri + '/' + $Configuration.ContainerName + '/' + $CorrelationId + '.json'
     $headers = @{
-        Authorization = ('Bearer ' + $token)
+        Authorization = ('Bearer ' + $Token)
         'x-ms-version' = '2023-11-03'
         'x-ms-date' = [DateTime]::UtcNow.ToString('R')
         'x-ms-blob-type' = 'BlockBlob'
@@ -327,21 +330,56 @@ function Send-TrustViewResult {
         -ContentType 'application/json; charset=utf-8' -TimeoutSec 30 -MaximumRedirection 0 -ErrorAction Stop
 }
 
-if ($MyInvocation.InvocationName -ne '.') {
+function Invoke-TrustViewWorker {
+    param([string]$EncodedRequest, [switch]$ValidateOnly)
+
     $ErrorActionPreference = 'Stop'
     $ProgressPreference = 'SilentlyContinue'
     $VerbosePreference = 'SilentlyContinue'
     $DebugPreference = 'SilentlyContinue'
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor
         [Net.SecurityProtocolType]::Tls12
+    $stage = 'configuration_validation'
     try {
         $configuration = Get-TrustViewConfiguration
-        $request = ConvertFrom-TrustViewRequest -EncodedRequest $RequestBase64
+        $stage = 'request_validation'
+        $request = ConvertFrom-TrustViewRequest -EncodedRequest $EncodedRequest
+        if ($ValidateOnly) {
+            Write-Output 'Configuration and request validation passed; no network calls or orders were made.'
+            return
+        }
+        $stage = 'order_processing'
         $result = Invoke-TrustViewOrder -Request $request -Configuration $configuration
-        Send-TrustViewResult -Result $result -CorrelationId $request.correlationId -Configuration $configuration
+        $stage = 'storage_identity'
+        $storageToken = Get-TrustViewManagedIdentityToken -Resource 'https://storage.azure.com/'
+        $stage = 'result_upload'
+        Send-TrustViewResult -Result $result -CorrelationId $request.correlationId `
+            -Configuration $configuration -Token $storageToken
         Write-Output 'TrustView processing finished; the result was stored for the workflow.'
     }
     catch {
-        throw 'TrustView processing could not publish its result. Check VM configuration and permissions before retrying.'
+        $httpStatus = ''
+        $exception = $_.Exception
+        while ($null -ne $exception) {
+            if ($null -ne $exception.PSObject.Properties['Response'] -and
+                $null -ne $exception.Response -and
+                $null -ne $exception.Response.PSObject.Properties['StatusCode']) {
+                $statusCode = 0
+                $statusValue = $exception.Response.StatusCode
+                if ($statusValue -is [enum]) { $statusValue = $statusValue.value__ }
+                if ([int]::TryParse([string]$statusValue, [ref]$statusCode) -and
+                    $statusCode -ge 100 -and $statusCode -le 599) {
+                    $httpStatus = " (HTTP $statusCode)"
+                }
+                break
+            }
+            $exception = $exception.InnerException
+        }
+        # Only fixed stage names and numeric HTTP status codes may leave the worker.
+        throw "TrustView worker failed during $stage$httpStatus. Check configuration and permissions; check TrustView before retrying because an order might have been created."
     }
+}
+
+if ($MyInvocation.InvocationName -ne '.') {
+    Invoke-TrustViewWorker -EncodedRequest $RequestBase64 -ValidateOnly:$ValidateOnly
 }
