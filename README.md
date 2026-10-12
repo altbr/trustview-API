@@ -26,7 +26,9 @@ authentication and network restrictions; Run Command does not replace those.
 ### Prerequisites and identities
 
 This version targets an **Azure Windows VM**, not an Azure Arc-enabled server.
-`dkmant0-01` must have a healthy Azure VM Agent and support managed Run Command.
+`dkmant0-01` must have a healthy Azure VM Agent and a supported managed Run
+Command OS (for example, Windows Server 2016 or later; Server 2012/R2 is not
+listed as supported).
 The worker runs under the agent's default privileged account with Windows
 PowerShell 5.1 or later. Its path and the target VM cannot be supplied by callers.
 If this server is Linux or Arc-enabled, the command and identity integration
@@ -164,7 +166,8 @@ and `502` for execution/API/result-storage failures.
 
 Run Command stdout is unsuitable for PFX delivery because output is limited and
 is retained in Azure execution diagnostics. Only a fixed, nonsensitive completion
-message is printed. API keys, generated passwords, PFX data, and raw upstream
+message is printed; the bootstrap suppresses the worker's output streams. API
+keys, generated passwords, PFX data, and raw upstream
 errors are never printed or passed as Run Command parameters. The parameter
 contains only base64-encoded request data and a generated correlation ID:
 **base64 is not encryption**, and request/contact data can be visible to
@@ -178,6 +181,12 @@ automatically. A failed response does not undo an existing order: inspect
 TrustView and correlate the Logic App run before retrying to avoid duplicate
 orders or deliveries. Monitor failed cleanup actions and enforce result expiry
 even when a run is cancelled.
+
+The worker publishes its terminal result once, without upload retries; the
+workflow requires HTTP 200 and a matching correlation ID before using it.
+`asyncExecution` acknowledges worker startup, not successful checkout. Managed
+Run Command deletion can terminate a still-running worker, so cleanup runs only
+after result retrieval or workflow failure/timeout.
 
 ### Validation
 
@@ -194,3 +203,10 @@ redaction, large PFX transport, and the workflow contract. They do not replace
 an Azure deployment test. Validate the ARM deployment in your subscription,
 then exercise email and download requests against a test ADCS template,
 including missing contacts, delayed issuance, denied permissions, and cleanup.
+
+Azure references:
+
+- [Managed Run Command on Windows VMs](https://learn.microsoft.com/en-us/azure/virtual-machines/windows/run-command-managed)
+- [Consumption Request/Response and asynchronous replies](https://learn.microsoft.com/en-us/azure/connectors/connectors-native-reqres)
+- [Logic Apps managed-identity authentication](https://learn.microsoft.com/en-us/azure/logic-apps/authenticate-with-managed-identity)
+- [Secure Logic Apps inputs and outputs](https://learn.microsoft.com/en-us/azure/logic-apps/set-up-security-permissions#secure-run-history)

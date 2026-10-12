@@ -195,7 +195,7 @@
                                             "location": "@parameters('VmLocation')",
                                             "properties": {
                                                 "source": {
-                                                    "script": "param([string]$RequestBase64)\n& 'C:\\TrustView\\Invoke-TrustViewOrder.ps1' -RequestBase64 $RequestBase64"
+                                                    "script": "param([string]$RequestBase64)\n$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\ntry {\n    & 'C:\\TrustView\\Invoke-TrustViewOrder.ps1' -RequestBase64 $RequestBase64 *> $null\n    Write-Output 'TrustView worker finished.'\n} catch {\n    throw 'TrustView worker failed; check VM configuration and permissions.'\n}"
                                                 },
                                                 "parameters": [
                                                     {
@@ -257,7 +257,7 @@
                                 "Parse_VM_result": {
                                     "type": "ParseJson",
                                     "inputs": {
-                                        "content": "@if(equals(outputs('Get_VM_result')?['statusCode'], 200), body('Get_VM_result'), json('{}'))",
+                                        "content": "@if(and(equals(outputs('Get_VM_result')?['statusCode'], 200), equals(body('Get_VM_result')?['body']?['correlationId'], workflow().run.name)), body('Get_VM_result'), json('{}'))",
                                         "schema": {
                                             "type": "object",
                                             "required": ["statusCode", "body"],
@@ -267,7 +267,13 @@
                                                     "type": "integer",
                                                     "enum": [200, 400, 422, 502, 504]
                                                 },
-                                                "body": { "type": "object" }
+                                                "body": {
+                                                    "type": "object",
+                                                    "required": ["correlationId"],
+                                                    "properties": {
+                                                        "correlationId": { "type": "string" }
+                                                    }
+                                                }
                                             }
                                         }
                                     },

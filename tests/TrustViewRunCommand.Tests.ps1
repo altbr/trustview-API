@@ -257,8 +257,11 @@ Describe 'Consumption workflow contract' {
     It 'pins remote execution to dkmant0-01 and a locally staged worker' {
         $submit = $template.resources[0].properties.definition.actions.Run_private_TrustView_order.actions.Submit_VM_Run_Command
         $submit.inputs.uri | Should -Match '/virtualMachines/dkmant0-01/runCommands/'
-        $submit.inputs.body.properties.source.script | Should -Be (
-            "param([string]`$RequestBase64)`n& 'C:\TrustView\Invoke-TrustViewOrder.ps1' -RequestBase64 `$RequestBase64"
+        $submit.inputs.body.properties.source.script | Should -Match (
+            [regex]::Escape("& 'C:\TrustView\Invoke-TrustViewOrder.ps1' -RequestBase64 `$RequestBase64 *> `$null")
+        )
+        $submit.inputs.body.properties.source.script | Should -Match (
+            [regex]::Escape("`$ProgressPreference = 'SilentlyContinue'")
         )
         $submit.inputs.body.properties.parameters[0].value | Should -Match '^@base64\('
         $submit.inputs.retryPolicy.type | Should -Be 'none'
@@ -272,6 +275,10 @@ Describe 'Consumption workflow contract' {
         $actions.Respond_VM_result.runtimeConfiguration.secureData.properties | Should -Contain 'inputs'
         $actions.Run_private_TrustView_order.actions.Parse_VM_result.runtimeConfiguration.secureData.properties |
             Should -Contain 'inputs'
+        $actions.Run_private_TrustView_order.actions.Parse_VM_result.inputs.content |
+            Should -Match "equals\(body\('Get_VM_result'\)\?\['body'\]\?\['correlationId'\], workflow\(\)\.run\.name\)"
+        $actions.Run_private_TrustView_order.actions.Parse_VM_result.inputs.schema.properties.body.required |
+            Should -Contain 'correlationId'
         $actions.Run_private_TrustView_order.actions.Wait_for_VM_result.actions.Get_VM_result.runtimeConfiguration.secureData.properties |
             Should -Contain 'outputs'
         $actions.Run_private_TrustView_order.actions.Wait_for_VM_result.operationOptions | Should -Be 'FailWhenLimitsReached'
