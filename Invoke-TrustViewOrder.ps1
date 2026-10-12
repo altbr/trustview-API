@@ -89,9 +89,22 @@ function Get-TrustViewManagedIdentityToken {
 
     $uri = 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=' +
         [uri]::EscapeDataString($Resource)
-    $response = Invoke-WebRequest -UseBasicParsing -Uri $uri -Method Get -Headers @{ Metadata = 'true' } `
-        -TimeoutSec 30 -MaximumRedirection 0 -ErrorAction Stop
-    $token = ($response.Content | ConvertFrom-Json -ErrorAction Stop).access_token
+    # IMDS must bypass proxies, including on Windows PowerShell 5.1.
+    $metadataRequest = [Net.HttpWebRequest]::Create($uri)
+    $metadataRequest.Proxy = $null
+    $metadataRequest.AllowAutoRedirect = $false
+    $metadataRequest.Timeout = 30000
+    $metadataRequest.ReadWriteTimeout = 30000
+    $metadataRequest.Headers.Add('Metadata', 'true')
+    $response = $metadataRequest.GetResponse()
+    try {
+        $reader = New-Object IO.StreamReader($response.GetResponseStream())
+        try {
+            $token = ($reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop).access_token
+        }
+        finally { $reader.Dispose() }
+    }
+    finally { $response.Dispose() }
     if ([string]::IsNullOrWhiteSpace($token)) {
         throw 'Managed identity did not return an access token.'
     }

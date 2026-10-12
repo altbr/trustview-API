@@ -271,11 +271,12 @@ Describe 'Consumption workflow contract' {
         $actions.Respond_VM_result.operationOptions | Should -Be 'Asynchronous'
         $actions.Respond_VM_result.runtimeConfiguration.secureData.properties | Should -Contain 'inputs'
         $actions.Run_private_TrustView_order.actions.Parse_VM_result.runtimeConfiguration.secureData.properties |
-            Should -Contain 'outputs'
+            Should -Contain 'inputs'
         $actions.Run_private_TrustView_order.actions.Wait_for_VM_result.actions.Get_VM_result.runtimeConfiguration.secureData.properties |
             Should -Contain 'outputs'
         $actions.Run_private_TrustView_order.actions.Wait_for_VM_result.operationOptions | Should -Be 'FailWhenLimitsReached'
         $actions.Cleanup_remote_artifacts.actions.Delete_VM_result.inputs.method | Should -Be 'DELETE'
+        $actions.Cleanup_remote_artifacts.actions.Delete_VM_result.operationOptions | Should -Be 'DisableAsyncPattern'
         $actions.Cleanup_remote_artifacts.actions.Delete_VM_Run_Command.inputs.method | Should -Be 'DELETE'
     }
 }

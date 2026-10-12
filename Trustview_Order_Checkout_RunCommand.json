@@ -153,7 +153,7 @@
                             },
                             "runAfter": {},
                             "runtimeConfiguration": {
-                                "secureData": { "properties": ["inputs", "outputs"] }
+                                "secureData": { "properties": ["inputs"] }
                             }
                         },
                         "Respond_invalid_request": {
@@ -275,7 +275,7 @@
                                         "Wait_for_VM_result": ["Succeeded"]
                                     },
                                     "runtimeConfiguration": {
-                                        "secureData": { "properties": ["inputs", "outputs"] }
+                                        "secureData": { "properties": ["inputs"] }
                                     }
                                 }
                             },
@@ -305,6 +305,7 @@
                                 },
                                 "Delete_VM_result": {
                                     "type": "Http",
+                                    "operationOptions": "DisableAsyncPattern",
                                     "inputs": {
                                         "uri": "@concat(parameters('ResultsBlobServiceUri'), '/', parameters('ResultsContainerName'), '/', workflow().run.name, '.json')",
                                         "method": "DELETE",
@@ -348,7 +349,7 @@
                                 "Run_private_TrustView_order": ["Succeeded"]
                             },
                             "runtimeConfiguration": {
-                                "secureData": { "properties": ["inputs", "outputs"] }
+                                "secureData": { "properties": ["inputs"] }
                             }
                         },
                         "Respond_remote_failure": {
