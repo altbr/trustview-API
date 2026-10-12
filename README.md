@@ -110,6 +110,101 @@ an administrator PowerShell session. The worker reads machine settings directly;
 do not set only your interactive user's environment. No API key is stored in
 these settings. Both workflow versions and the worker target the Azure public cloud.
 
+### Test the PowerShell worker manually
+
+Run this test **on `dkmant0-01`**, in an administrator Windows PowerShell 5.1
+or later session, after installing the worker, setting all six machine-level
+environment variables above, and granting the **VM identity** its Key Vault
+secret-read and result-container write permissions. You do not need to trigger
+the Logic App or sign in to Azure PowerShell: the worker uses the VM's managed
+identity through IMDS. Running it on your workstation will not use that identity.
+
+Keep the Logic App disabled during this test. **This is a real certificate order,
+not a dry run**, and email delivery sends real emails. Use a test ADCS template,
+a test domain, and an existing TrustView contact that uniquely matches an email
+address you control. Do not bypass your organization's execution policy or
+enable PowerShell transcription/debug logging.
+
+In the same PowerShell session, build the request; replace the example domain
+and email before running it:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$correlationId = 'manual-' + [guid]::NewGuid().ToString('N')
+$request = @{
+    domains = @('service.example.internal')
+    contactEmail = 'owner@example.internal'
+    deliveryMethod = 'email'
+    keyspec = 'RSA:2048'
+    ip_sans = @()
+    comment = 'Manual VM worker test'
+    correlationId = $correlationId
+}
+$requestJson = $request | ConvertTo-Json -Depth 10 -Compress
+$requestBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($requestJson))
+$blobName = $correlationId + '.json'
+```
+
+`correlationId` is required when calling the worker directly; the Logic App
+normally adds it for you. Generate a new ID for each attempt, but check TrustView
+before retrying a failed attempt to avoid duplicate orders.
+
+Invoke the installed worker with the **call operator `&`**, not dot-sourcing
+(`.`), which only loads its functions:
+
+```powershell
+& 'C:\TrustView\Invoke-TrustViewOrder.ps1' -RequestBase64 $requestBase64
+```
+
+Allow several minutes for issuance. The normal console output is:
+
+```text
+TrustView processing finished; the result was stored for the workflow.
+```
+
+This confirms result publication, **not successful checkout**. Both successful
+orders and handled API failures are stored as JSON in:
+
+```text
+<ResultsBlobServiceUri>/<ResultsContainerName>/<correlationId>.json
+```
+
+To verify the result, use Azure Portal's Storage browser with **Microsoft Entra
+user authentication** and your own authorized operator account. That account
+needs blob read/delete permissions on the result container (for example,
+Storage Blob Data Contributor at container scope), portal resource visibility,
+and a permitted storage network path. Do not add blob-read permissions to the
+write-only VM identity just to inspect this test.
+
+Locate the exact blob named by `$blobName` and inspect it in a secure viewer:
+
+- Check that `body.correlationId` matches `$correlationId`.
+- `statusCode: 200` with
+  `body.status: "order_created_contact_added_and_delivery_requested"` means
+  TrustView accepted the email checkout. Confirm receipt of the certificate
+  and separate password email at your test address.
+- `422` means contact matching failed, `504` means issuance readiness timed
+  out, and `502` means processing/API failure. Check `body.error`,
+  `body.message`, and any `body.certificateId`; inspect TrustView before retrying.
+- A thrown error with no result blob points to request/configuration validation
+  or result-publication failure. Check the six machine settings, VM identity,
+  Key Vault/storage RBAC, and network/TLS connectivity; do not print tokens or
+  the API key while troubleshooting.
+
+For a separate download test, set `deliveryMethod = 'download'` in the request
+and rerun the preparation block to generate a **new** correlation ID and encoded
+payload before invoking the worker. A successful result has
+`body.status: "order_created_contact_added_and_downloaded"` plus `pfxBase64`
+and `pfxPassword`. Treat the entire result as a secret: do not print it,
+paste it into a PR, or store it in an unprotected download location.
+
+**Clean up manually:** delete the exact test result blob after inspection;
+the Logic App will not clean up this direct invocation. Securely remove any
+local copies and account for the storage retention caveats above. No Run
+Command resource is created by this local test. Passing it validates the worker
+and VM dependencies, not Logic App permissions, Run Command's SYSTEM execution
+context, or the asynchronous client path; test those separately afterward.
+
 ### Publish through Logic App Code View
 
 1. Create or open a **Consumption** Logic App in Azure Portal. Keep it disabled
