@@ -127,7 +127,7 @@ function Get-TrustViewArcChallengeSecret {
             [Environment+SpecialFolder]::CommonApplicationData)) 'AzureConnectedMachineAgent/Tokens')
     )
 
-    if ($Challenge -cnotmatch '^Basic realm=(?:"([^"\r\n]+)"|([^"\r\n]+))$') {
+    if ($Challenge -notmatch '\ABasic realm=[ \t]*(?:"([^"\r\n]+)"|([^"\r\n]+?))[ \t]*\z') {
         throw 'Arc identity returned an invalid authentication challenge.'
     }
     $path = $Matches[1]

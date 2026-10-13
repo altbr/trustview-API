@@ -149,14 +149,33 @@ Describe 'Arc challenge-file validation' {
         Set-Content -LiteralPath $tokenPath -Value 'test-only-challenge-secret'
     }
 
-    It 'reads a direct token file with <Quoted> quoting' -ForEach @(
-        @{ Quoted = $false }
-        @{ Quoted = $true }
+    It 'reads a direct token file with <Name>' -ForEach @(
+        @{ Name = 'an unquoted realm'; Prefix = 'Basic realm='; Suffix = '' }
+        @{ Name = 'a quoted realm'; Prefix = 'Basic realm="'; Suffix = '"' }
+        @{ Name = 'a lowercase scheme'; Prefix = 'basic realm='; Suffix = '' }
+        @{ Name = 'an uppercase scheme and parameter'; Prefix = 'BASIC REALM="'; Suffix = '"' }
+        @{ Name = 'a mixed-case scheme and parameter'; Prefix = 'bAsIc ReAlM='; Suffix = '' }
+        @{ Name = 'a whitespace-padded unquoted realm'; Prefix = "Basic realm= `t"; Suffix = "`t " }
+        @{ Name = 'a whitespace-padded quoted realm'; Prefix = 'Basic realm=  "'; Suffix = '"  ' }
     ) {
-        $challenge = 'Basic realm=' + $tokenPath
-        if ($Quoted) { $challenge = 'Basic realm="' + $tokenPath + '"' }
+        $challenge = $Prefix + $tokenPath + $Suffix
         Get-TrustViewArcChallengeSecret -Challenge $challenge -TokenDirectory $tokenDirectory |
             Should -Be 'test-only-challenge-secret'
+    }
+
+    It 'rejects <Name> around a valid token path before accessing files' -ForEach @(
+        @{ Name = 'a missing opening quote'; Prefix = 'Basic realm='; Suffix = '"' }
+        @{ Name = 'a missing closing quote'; Prefix = 'Basic realm="'; Suffix = '' }
+        @{ Name = 'repeated quotes'; Prefix = 'Basic realm=""'; Suffix = '""' }
+        @{ Name = 'a leading carriage return'; Prefix = "Basic realm=`r"; Suffix = '' }
+        @{ Name = 'a leading newline'; Prefix = "Basic realm=`n"; Suffix = '' }
+        @{ Name = 'a trailing newline'; Prefix = 'Basic realm='; Suffix = "`n" }
+    ) {
+        Mock Get-Item { throw 'Should not access an untrusted file' }
+        $challenge = $Prefix + $tokenPath + $Suffix
+        { Get-TrustViewArcChallengeSecret -Challenge $challenge -TokenDirectory $tokenDirectory } |
+            Should -Throw 'Arc identity returned an invalid authentication challenge.'
+        Should -Invoke Get-Item -Times 0
     }
 
     It 'rejects malformed challenge <Challenge>' -ForEach @(
